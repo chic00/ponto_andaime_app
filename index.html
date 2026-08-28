@@ -142,13 +142,16 @@ const rentalService = {
   },
   async create(form){
     const { data: userData } = await sb.auth.getUser();
-    const row = { ...rentalToRow(form), owner: userData.user.id };
+    const customerId = await customerService.upsertFromRentalForm(form, userData.user.id);
+    const row = { ...rentalToRow(form), owner: userData.user.id, customer_id: customerId };
     const { data, error } = await sb.from('rentals').insert(row).select('*, photos(*)').single();
     if(error) throw error;
     return rowToRental(data);
   },
   async update(id, form){
-    const row = { ...rentalToRow(form), updated_at: new Date().toISOString() };
+    const { data: userData } = await sb.auth.getUser();
+    const customerId = await customerService.upsertFromRentalForm(form, userData.user.id);
+    const row = { ...rentalToRow(form), customer_id: customerId, updated_at: new Date().toISOString() };
     const { data, error } = await sb.from('rentals').update(row).eq('id', id).select('*, photos(*)').single();
     if(error) throw error;
     return rowToRental(data);
@@ -162,6 +165,69 @@ const rentalService = {
     if(error) throw error;
   }
 };
+
+/* ---- customerService -------------------------------------------------------
+   Cadastro de cliente "mestre", reaproveitável entre locações. Cada locação
+   continua guardando sua PRÓPRIA cópia dos dados do cliente (nome/telefone/
+   etc. no momento daquela locação) — isso é proposital: se o telefone do
+   cliente mudar depois, o histórico da locação antiga continua mostrando o
+   que era válido na época. O registro em "customers" serve só para reuso
+   (autocompletar) e para a tela de Clientes, sem apagar histórico de ninguém.
+   ========================================================================= */
+const customerService = {
+  async list(){
+    const { data, error } = await sb.from('customers').select('*').order('name');
+    if(error) throw error;
+    return data.map(c => ({ id:c.id, name:c.name, document:c.document||'', phone:c.phone||'', whatsapp:c.whatsapp||'', email:c.email||'', notes:c.notes||'', createdAt:c.created_at }));
+  },
+  async create(data, ownerId){
+    const { data: userData } = ownerId ? { data:{ user:{id:ownerId} } } : await sb.auth.getUser();
+    const row = { owner: userData.user.id, name:data.name, document:data.document, phone:data.phone, whatsapp:data.whatsapp, email:data.email, notes:data.notes };
+    const { data: inserted, error } = await sb.from('customers').insert(row).select().single();
+    if(error) throw error;
+    return inserted;
+  },
+  async update(id, data){
+    const { error } = await sb.from('customers').update({
+      name:data.name, document:data.document, phone:data.phone, whatsapp:data.whatsapp, email:data.email, notes:data.notes, updated_at:new Date().toISOString()
+    }).eq('id', id);
+    if(error) throw error;
+  },
+  async remove(id){
+    const { error } = await sb.from('customers').delete().eq('id', id);
+    if(error) throw error;
+  },
+  async search(query){
+    if(!query || !query.trim()) return [];
+    const q = `%${query.trim()}%`;
+    const { data, error } = await sb.from('customers').select('*').or(`name.ilike.${q},phone.ilike.${q},whatsapp.ilike.${q},document.ilike.${q}`).limit(8);
+    if(error) throw error;
+    return data;
+  },
+  /* Cria ou atualiza silenciosamente o cliente-mestre a partir dos dados
+     digitados numa locação — usa o documento (ou nome+telefone, se não
+     houver documento) como chave para saber se é o mesmo cliente de novo. */
+  async upsertFromRentalForm(form, ownerId){
+    if(!form.customerName || !form.customerName.trim()) return null;
+    let existing = null;
+    if(form.document && form.document.trim()){
+      const { data } = await sb.from('customers').select('id').eq('document', form.document.trim()).maybeSingle();
+      existing = data;
+    }
+    if(!existing && form.phone && form.phone.trim()){
+      const { data } = await sb.from('customers').select('id').eq('phone', form.phone.trim()).ilike('name', form.customerName.trim()).maybeSingle();
+      existing = data;
+    }
+    const payload = { name:form.customerName, document:form.document, phone:form.phone, whatsapp:form.whatsapp, email:form.email, notes:form.customerNotes };
+    if(existing){
+      await this.update(existing.id, payload);
+      return existing.id;
+    }
+    const created = await this.create(payload, ownerId);
+    return created.id;
+  }
+};
+
 
 /* ---- photoService ---------------------------------------------------------
    Fotos agora são arquivos reais no Supabase Storage (bucket privado), não
@@ -195,8 +261,69 @@ const photoService = {
     const { data, error } = await sb.storage.from(PHOTOS_BUCKET).createSignedUrl(storagePath, 3600);
     if(error) throw error;
     return data.signedUrl;
+  },
+  /* Apaga as fotos (arquivo + registro) de locações cuja devolução prevista
+     (ou, se não houver, a data da locação) já passou há mais de `days` dias.
+     A locação em si NÃO é apagada — só as fotos, que são o que mais pesa no
+     armazenamento e, segundo o combinado, não precisam ficar guardadas
+     depois que o andaime já foi retirado da obra. */
+  async findOldPhotoCandidates(days){
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - days);
+    const cutoffStr = cutoff.toISOString().slice(0,10);
+    const { data, error } = await sb.from('rentals')
+      .select('id, customer_name, rental_date, expected_return_date, photos(id, storage_path)')
+      .lt('expected_return_date', cutoffStr);
+    if(error) throw error;
+    return data.filter(r => r.photos && r.photos.length > 0).map(r => ({
+      rentalId:r.id, customerName:r.customer_name, referenceDate:r.expected_return_date || r.rental_date,
+      photoCount:r.photos.length, photos:r.photos
+    }));
+  },
+  async cleanupOldPhotos(candidates){
+    let removed = 0;
+    for(const c of candidates){
+      const paths = c.photos.map(p => p.storage_path);
+      if(paths.length) await sb.storage.from(PHOTOS_BUCKET).remove(paths);
+      const ids = c.photos.map(p => p.id);
+      await sb.from('photos').delete().in('id', ids);
+      removed += ids.length;
+    }
+    return removed;
   }
 };
+
+/* Comprimir/redimensionar a foto no navegador antes do upload — de graça,
+   sem depender de nenhum plano pago do Supabase. Reduz uma foto de celular
+   de ~1.3MB pra tipicamente 150-350KB, sem perda visível de qualidade pra
+   fins de registro de obra. */
+function compressImage(file, { maxDimension = 1600, quality = 0.72 } = {}){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Falha ao ler o arquivo.'));
+    reader.onload = () => {
+      img.onerror = () => reject(new Error('Falha ao processar a imagem.'));
+      img.onload = () => {
+        let { width, height } = img;
+        if(width > maxDimension || height > maxDimension){
+          if(width >= height){ height = Math.round(height * (maxDimension / width)); width = maxDimension; }
+          else{ width = Math.round(width * (maxDimension / height)); height = maxDimension; }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        canvas.toBlob(blob => {
+          if(!blob){ reject(new Error('Falha ao comprimir a imagem.')); return; }
+          const compressedFile = new File([blob], file.name.replace(/\.(png|webp)$/i, '.jpg'), { type:'image/jpeg' });
+          resolve(compressedFile);
+        }, 'image/jpeg', quality);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 const locationService = {
   parseLatLng(url){
@@ -453,6 +580,7 @@ const NAV_ITEMS = [
   { key:'dashboard', label:'Dashboard', icon:'📊' },
   { key:'rentals', label:'Locações', icon:'🏗️' },
   { key:'new', label:'Nova Locação', icon:'➕' },
+  { key:'clients', label:'Clientes', icon:'👥' },
   { key:'settings', label:'Configurações', icon:'⚙️' },
 ];
 
@@ -493,7 +621,7 @@ function Sidebar({active, onNavigate, session, onLogout}){
 function BottomNav({active, onNavigate}){
   const items = [
     { key:'dashboard', label:'Início', icon:'📊' }, { key:'rentals', label:'Locações', icon:'🏗️' },
-    { key:'new', label:'Nova', icon:'➕' }, { key:'settings', label:'Ajustes', icon:'⚙️' },
+    { key:'new', label:'Nova', icon:'➕' }, { key:'clients', label:'Clientes', icon:'👥' }, { key:'settings', label:'Ajustes', icon:'⚙️' },
   ];
   return (
     <nav style={{position:'fixed', bottom:0, left:0, right:0, background:'var(--charcoal)', display:'flex', padding:'6px 4px calc(env(safe-area-inset-bottom) + 6px)', zIndex:80, boxShadow:'0 -4px 16px rgba(0,0,0,.2)'}} className="md:hidden">
@@ -677,12 +805,39 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
   const [existingPhotos, setExistingPhotos] = useState(initial ? initial.photos : []);
   const [existingUrls, setExistingUrls] = useState({});
   const [pendingPhotos, setPendingPhotos] = useState([]); // {tempId, file, previewUrl, description}
+  const [compressing, setCompressing] = useState(false);
   const [loadingPhotos, setLoadingPhotos] = useState(isEdit);
   const [errors, setErrors] = useState({});
   const [saving, setSaving] = useState(false);
   const fileInputRef = useRef(null);
   const cameraInputRef = useRef(null);
   const [lightbox, setLightbox] = useState(null);
+  const [customerQuery, setCustomerQuery] = useState('');
+  const [customerSuggestions, setCustomerSuggestions] = useState([]);
+  const [searchingCustomer, setSearchingCustomer] = useState(false);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const customerSearchTimer = useRef(null);
+
+  function onCustomerNameChange(value){
+    set('customerName', value);
+    if(isEdit) return; // não sugere durante edição de uma locação já existente
+    setCustomerQuery(value);
+    setShowSuggestions(true);
+    if(customerSearchTimer.current) clearTimeout(customerSearchTimer.current);
+    if(!value || value.trim().length < 2){ setCustomerSuggestions([]); return; }
+    customerSearchTimer.current = setTimeout(async () => {
+      setSearchingCustomer(true);
+      try{ setCustomerSuggestions(await customerService.search(value)); }
+      catch(err){ /* busca silenciosa: se falhar, só não sugere nada */ }
+      finally{ setSearchingCustomer(false); }
+    }, 350);
+  }
+  function pickCustomer(c){
+    setForm(f => ({...f, customerName:c.name, document:c.document||'', phone:c.phone||'', whatsapp:c.whatsapp||'', email:c.email||'', customerNotes:c.notes||''}));
+    setShowSuggestions(false);
+    setCustomerSuggestions([]);
+    pushToast(`Dados de "${c.name}" preenchidos automaticamente.`, 'success');
+  }
 
   useEffect(() => {
     if(!isEdit) return;
@@ -711,11 +866,17 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
     return Object.keys(e).length === 0;
   }
 
-  function handleFiles(fileList){
+  async function handleFiles(fileList){
     const files = Array.from(fileList || []).filter(f => /image\/(jpeg|jpg|png|webp)/.test(f.type));
     if(files.length === 0) return;
-    const added = files.map(file => ({ tempId: uid('tmp'), file, previewUrl: URL.createObjectURL(file), description:'' }));
-    setPendingPhotos(p => [...p, ...added]);
+    setCompressing(true);
+    try{
+      const compressed = await Promise.all(files.map(f => compressImage(f).catch(() => f)));
+      const added = compressed.map(file => ({ tempId: uid('tmp'), file, previewUrl: URL.createObjectURL(file), description:'' }));
+      setPendingPhotos(p => [...p, ...added]);
+    } finally {
+      setCompressing(false);
+    }
   }
   function removePending(tempId){ setPendingPhotos(p => p.filter(x => x.tempId !== tempId)); }
   function updatePendingDesc(tempId, desc){ setPendingPhotos(p => p.map(x => x.tempId === tempId ? {...x, description:desc} : x)); }
@@ -769,7 +930,22 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
         <h2 style={{fontSize:15, margin:'0 0 16px'}}>👤 Dados do cliente</h2>
         <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(220px,1fr))', gap:0}}>
           <Field label="Nome completo / Razão social" required>
-            <Input value={form.customerName} onChange={e=>set('customerName', e.target.value)} placeholder="Ex.: Construtora Vale Verde Ltda" />
+            <div style={{position:'relative'}}>
+              <Input value={form.customerName} onChange={e=>onCustomerNameChange(e.target.value)} onFocus={()=>setShowSuggestions(true)} onBlur={()=>setTimeout(()=>setShowSuggestions(false),150)} placeholder="Ex.: Construtora Vale Verde Ltda" autoComplete="off" />
+              {showSuggestions && (searchingCustomer || customerSuggestions.length > 0) && (
+                <div style={{position:'absolute', top:'100%', left:0, right:0, background:'#fff', border:'1px solid var(--steel-line)', borderRadius:8, marginTop:4, boxShadow:'0 8px 20px rgba(0,0,0,.12)', zIndex:10, maxHeight:220, overflowY:'auto'}}>
+                  {searchingCustomer ? (
+                    <div style={{padding:'10px 12px', fontSize:12.5, color:'var(--ink-soft)'}}>Buscando…</div>
+                  ) : customerSuggestions.map(c => (
+                    <button type="button" key={c.id} onMouseDown={()=>pickCustomer(c)} className="focus-ring" style={{display:'block', width:'100%', textAlign:'left', padding:'10px 12px', border:'none', background:'none', borderBottom:'1px solid #F0EEE8'}}>
+                      <div style={{fontWeight:700, fontSize:13.5}}>{c.name}</div>
+                      <div style={{fontSize:11.5, color:'var(--ink-soft)'}}>{[c.phone, c.document].filter(Boolean).join(' · ') || 'Cliente cadastrado'}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <span style={{display:'block', fontSize:11.5, color:'var(--ink-soft)', marginTop:4, textTransform:'none'}}>Já cadastrado antes? Comece a digitar o nome — os dados preenchem sozinhos.</span>
             {errors.customerName && <span style={{color:'var(--danger)', fontSize:12}}>{errors.customerName}</span>}
           </Field>
           <Field label="CPF / CNPJ"><Input value={form.document} onChange={e=>set('document', maskDocument(e.target.value))} placeholder="000.000.000-00" /></Field>
@@ -851,6 +1027,7 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
         </div>
 
         {loadingPhotos && <Spinner label="Carregando fotos…" />}
+        {compressing && <Spinner label="Otimizando fotos…" />}
 
         {!loadingPhotos && existingPhotos.length === 0 && pendingPhotos.length === 0 ? (
           <div style={{textAlign:'center', padding:'28px', color:'var(--ink-soft)', fontSize:13.5, border:'1px dashed var(--steel-line)', borderRadius:10, textTransform:'none'}}>Nenhuma foto adicionada ainda.</div>
@@ -1007,9 +1184,129 @@ function DetailItem({label, value, block, link}){
 /* =========================================================================
    CONFIGURAÇÕES
    ========================================================================= */
+/* =========================================================================
+   CLIENTES
+   ========================================================================= */
+function ClientsScreen({onOpenClientRentals, pushToast}){
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState('');
+  const [editing, setEditing] = useState(null); // customer object ou {} pra novo
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try{ setCustomers(await customerService.list()); }
+    catch(err){ pushToast('Erro ao carregar clientes: ' + err.message, 'error'); }
+    finally{ setLoading(false); }
+  }, [pushToast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const filtered = customers.filter(c => {
+    const q = query.trim().toLowerCase();
+    return !q || c.name.toLowerCase().includes(q) || (c.phone||'').includes(q) || (c.document||'').includes(q);
+  });
+
+  async function handleDelete(){
+    setDeleting(true);
+    try{
+      await customerService.remove(deleteTarget.id);
+      pushToast('Cliente removido do cadastro. O histórico de locações antigas dele continua intacto.', 'success');
+      setDeleteTarget(null);
+      load();
+    }catch(err){ pushToast('Erro ao remover: ' + err.message, 'error'); }
+    finally{ setDeleting(false); }
+  }
+
+  return (
+    <div className="fade-in">
+      <div style={{display:'flex', gap:10, marginBottom:16, flexWrap:'wrap', alignItems:'center'}}>
+        <div style={{flex:'1 1 240px', position:'relative'}}>
+          <span style={{position:'absolute', left:12, top:11.5, opacity:.5}}>🔎</span>
+          <Input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Pesquisar por nome, telefone ou documento..." style={{paddingLeft:36}} />
+        </div>
+        <button onClick={()=>setEditing({})} className="focus-ring" style={{background:'var(--safety)', color:'#fff', border:'none', padding:'11px 18px', borderRadius:8, fontWeight:700, fontSize:13.5}}>+ Novo Cliente</button>
+      </div>
+
+      {loading ? <Spinner label="Carregando clientes…" /> : filtered.length === 0 ? (
+        <Card><EmptyState icon="👥" title="Nenhum cliente cadastrado" message="Clientes aparecem aqui automaticamente quando você cadastra uma locação — ou cadastre um manualmente." actionLabel="+ Novo Cliente" onAction={()=>setEditing({})} /></Card>
+      ) : (
+        <div style={{display:'flex', flexDirection:'column', gap:10}}>
+          {filtered.map(c => (
+            <Card key={c.id}>
+              <div style={{display:'flex', justifyContent:'space-between', gap:10, flexWrap:'wrap'}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontWeight:700, fontSize:15}}>{c.name}</div>
+                  <div style={{fontSize:13, color:'var(--ink-soft)', marginTop:2}}>{[c.phone, c.document].filter(Boolean).join(' · ') || 'Sem telefone/documento'}</div>
+                  {c.email && <div style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:2}}>{c.email}</div>}
+                </div>
+                <div style={{display:'flex', gap:8}}>
+                  <button onClick={()=>setEditing(c)} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid var(--steel-line)', background:'#fff', fontSize:12.5, fontWeight:600}}>✏️ Editar</button>
+                  <button onClick={()=>setDeleteTarget(c)} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontSize:12.5, fontWeight:600}}>🗑️</button>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {editing && <ClientEditModal customer={editing} onClose={()=>setEditing(null)} onSaved={()=>{ setEditing(null); load(); }} pushToast={pushToast} />}
+
+      <ConfirmModal open={!!deleteTarget} busy={deleting} title="Remover cliente"
+        message={deleteTarget ? `Remover "${deleteTarget.name}" do cadastro de clientes? As locações já registradas para ele NÃO são apagadas, só o atalho de preenchimento automático.` : ''}
+        confirmLabel="Remover" onConfirm={handleDelete} onCancel={()=>setDeleteTarget(null)} />
+    </div>
+  );
+}
+
+function ClientEditModal({customer, onClose, onSaved, pushToast}){
+  const isNew = !customer.id;
+  const [form, setForm] = useState({ name:customer.name||'', document:customer.document||'', phone:customer.phone||'', whatsapp:customer.whatsapp||'', email:customer.email||'', notes:customer.notes||'' });
+  const [saving, setSaving] = useState(false);
+  function set(f,v){ setForm(s=>({...s,[f]:v})); }
+  async function save(e){
+    e.preventDefault();
+    if(!form.name.trim()){ pushToast('Informe o nome do cliente.', 'error'); return; }
+    setSaving(true);
+    try{
+      if(isNew) await customerService.create(form);
+      else await customerService.update(customer.id, form);
+      pushToast('Cliente salvo com sucesso.', 'success');
+      onSaved();
+    }catch(err){ pushToast('Erro ao salvar: ' + err.message, 'error'); }
+    finally{ setSaving(false); }
+  }
+  return (
+    <div style={{position:'fixed', inset:0, background:'rgba(28,33,38,.55)', zIndex:150, display:'flex', alignItems:'center', justifyContent:'center', padding:16}} onClick={onClose}>
+      <form onSubmit={save} onClick={e=>e.stopPropagation()} className="fade-in" style={{background:'#fff', borderRadius:14, maxWidth:480, width:'100%', padding:24, boxShadow:'0 20px 60px rgba(0,0,0,.3)', maxHeight:'90vh', overflowY:'auto'}}>
+        <h3 style={{margin:'0 0 18px', fontSize:18}}>{isNew ? 'Novo cliente' : 'Editar cliente'}</h3>
+        <Field label="Nome completo / Razão social" required><Input value={form.name} onChange={e=>set('name', e.target.value)} /></Field>
+        <Field label="CPF / CNPJ"><Input value={form.document} onChange={e=>set('document', maskDocument(e.target.value))} /></Field>
+        <Field label="Telefone"><Input value={form.phone} onChange={e=>set('phone', maskPhone(e.target.value))} /></Field>
+        <Field label="WhatsApp"><Input value={form.whatsapp} onChange={e=>set('whatsapp', maskPhone(e.target.value))} /></Field>
+        <Field label="E-mail"><Input type="email" value={form.email} onChange={e=>set('email', e.target.value)} /></Field>
+        <Field label="Observações"><Textarea value={form.notes} onChange={e=>set('notes', e.target.value)} /></Field>
+        <div style={{display:'flex', gap:10, justifyContent:'flex-end', marginTop:8}}>
+          <button type="button" onClick={onClose} className="focus-ring" style={{padding:'10px 18px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:600}}>Cancelar</button>
+          <button type="submit" disabled={saving} className="focus-ring" style={{padding:'10px 20px', borderRadius:8, border:'none', background:'var(--safety)', color:'#fff', fontWeight:700, opacity:saving?.7:1}}>{saving?'Salvando…':'Salvar'}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+
 function SettingsScreen({pushToast}){
   const [form, setForm] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [days, setDays] = useState(30);
+  const [candidates, setCandidates] = useState(null);
+  const [checkingCleanup, setCheckingCleanup] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  const [confirmCleanup, setConfirmCleanup] = useState(false);
+
   useEffect(() => { settingsService.get().then(setForm).catch(err => pushToast('Erro ao carregar configurações: ' + err.message, 'error')); }, []);
   function set(f,v){ setForm(s=>({...s,[f]:v})); }
   async function save(e){
@@ -1019,9 +1316,31 @@ function SettingsScreen({pushToast}){
     catch(err){ pushToast('Erro ao salvar: ' + err.message, 'error'); }
     finally{ setSaving(false); }
   }
+
+  async function checkCleanup(){
+    setCheckingCleanup(true);
+    setCandidates(null);
+    try{
+      const found = await photoService.findOldPhotoCandidates(Number(days) || 30);
+      setCandidates(found);
+      if(found.length === 0) pushToast('Nenhuma foto passou do prazo definido.', 'info');
+    }catch(err){ pushToast('Erro ao verificar: ' + err.message, 'error'); }
+    finally{ setCheckingCleanup(false); }
+  }
+  async function runCleanup(){
+    setCleaning(true);
+    try{
+      const removed = await photoService.cleanupOldPhotos(candidates);
+      pushToast(`${removed} foto(s) removida(s) de ${candidates.length} locação(ões). As locações continuam no histórico.`, 'success');
+      setCandidates(null);
+    }catch(err){ pushToast('Erro ao limpar: ' + err.message, 'error'); }
+    finally{ setCleaning(false); setConfirmCleanup(false); }
+  }
+
   if(!form) return <Spinner label="Carregando configurações…" />;
   return (
-    <form onSubmit={save} className="fade-in">
+    <div className="fade-in" style={{display:'flex', flexDirection:'column', gap:16}}>
+    <form onSubmit={save}>
       <Card style={{maxWidth:560}}>
         <h2 style={{fontSize:15, margin:'0 0 16px'}}>⚙️ Dados da empresa</h2>
         <Field label="Nome da empresa"><Input value={form.companyName} onChange={e=>set('companyName', e.target.value)} /></Field>
@@ -1038,6 +1357,36 @@ function SettingsScreen({pushToast}){
         </button>
       </Card>
     </form>
+
+    <Card style={{maxWidth:560}}>
+      <h2 style={{fontSize:15, margin:'0 0 6px'}}>🧹 Limpar fotos antigas</h2>
+      <p style={{fontSize:12.5, color:'var(--ink-soft)', margin:'0 0 16px', textTransform:'none', lineHeight:1.5}}>
+        Apaga só as FOTOS (não a locação) de obras cuja devolução já passou há mais de X dias. Útil para liberar espaço de armazenamento — nada aqui roda sozinho, você decide quando rodar.
+      </p>
+      <div style={{display:'flex', gap:10, alignItems:'flex-end', flexWrap:'wrap', marginBottom:14}}>
+        <Field label="Fotos com devolução há mais de (dias)" hint="">
+          <Input type="number" min="1" value={days} onChange={e=>setDays(e.target.value)} style={{width:120}} />
+        </Field>
+        <button type="button" onClick={checkCleanup} disabled={checkingCleanup} className="focus-ring" style={{padding:'11px 18px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13.5, marginBottom:16}}>
+          {checkingCleanup ? 'Verificando…' : '🔍 Verificar'}
+        </button>
+      </div>
+
+      {candidates && candidates.length > 0 && (
+        <div style={{background:'var(--concrete)', borderRadius:10, padding:14, marginBottom:14}}>
+          <div style={{fontWeight:700, fontSize:13.5, marginBottom:8}}>{candidates.reduce((s,c)=>s+c.photoCount,0)} foto(s) em {candidates.length} locação(ões) serão apagadas:</div>
+          <ul style={{margin:0, paddingLeft:18, fontSize:12.5, color:'var(--ink-soft)', maxHeight:160, overflowY:'auto'}}>
+            {candidates.map(c => (<li key={c.rentalId}>{c.customerName} — {c.photoCount} foto(s), devolução em {formatDate(c.referenceDate)}</li>))}
+          </ul>
+          <button type="button" onClick={()=>setConfirmCleanup(true)} className="focus-ring" style={{marginTop:12, padding:'10px 18px', borderRadius:8, border:'none', background:'var(--danger)', color:'#fff', fontWeight:700, fontSize:13.5}}>🗑️ Apagar essas fotos</button>
+        </div>
+      )}
+
+      <ConfirmModal open={confirmCleanup} busy={cleaning} title="Apagar fotos antigas"
+        message={candidates ? `Confirma apagar ${candidates.reduce((s,c)=>s+c.photoCount,0)} foto(s) de ${candidates.length} locação(ões)? As locações continuam no histórico, só as fotos somem. Isso não pode ser desfeito.` : ''}
+        confirmLabel="Apagar fotos" onConfirm={runCleanup} onCancel={()=>setConfirmCleanup(false)} />
+    </Card>
+    </div>
   );
 }
 
@@ -1114,7 +1463,7 @@ function App(){
   if(checkingSession) return <div style={{minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', background:'var(--charcoal)'}}><Spinner label="Carregando…" /></div>;
   if(!session) return <LoginScreen onLogin={handleLogin} />;
 
-  const titles = { dashboard:'Dashboard', rentals:'Locações', new:'Nova Locação', form: editingRentalId ? 'Editar Locação' : 'Nova Locação', details:'Detalhes da Locação', settings:'Configurações' };
+  const titles = { dashboard:'Dashboard', rentals:'Locações', new:'Nova Locação', form: editingRentalId ? 'Editar Locação' : 'Nova Locação', details:'Detalhes da Locação', clients:'Clientes', settings:'Configurações' };
 
   let content = null;
   if(loadingRentals && (screen==='dashboard' || screen==='rentals')){
@@ -1129,6 +1478,8 @@ function App(){
     content = editingRental ? <RentalForm initial={editingRental} onCancel={()=>{setScreen('details');}} onSaved={handleSaved} pushToast={push} /> : <Spinner label="Carregando locação…" />;
   } else if(screen === 'details' && activeRentalId){
     content = activeRental ? <RentalDetails rental={activeRental} onBack={()=>navigate('rentals')} onEdit={()=>{setEditingRentalId(activeRental.id); setEditingRental(activeRental); setScreen('form');}} onDeleteRequest={requestDelete} pushToast={push} /> : <Spinner label="Carregando locação…" />;
+  } else if(screen === 'clients'){
+    content = <ClientsScreen pushToast={push} />;
   } else if(screen === 'settings'){
     content = <SettingsScreen pushToast={push} />;
   }
