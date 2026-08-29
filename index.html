@@ -95,7 +95,7 @@ const authService = {
 
 function rowToRental(row){
   return {
-    id: row.id, customerName: row.customer_name, document: row.document || '', phone: row.phone || '',
+    id: row.id, customerId: row.customer_id || null, customerName: row.customer_name, document: row.document || '', phone: row.phone || '',
     whatsapp: row.whatsapp || '', email: row.email || '', customerNotes: row.customer_notes || '',
     rentalDate: row.rental_date || '', expectedReturnDate: row.expected_return_date || '',
     items: (row.rental_items || []).map(i => ({ id:i.id, equipmentType:i.equipment_type, quantity:i.quantity || '' })),
@@ -1399,13 +1399,14 @@ function exportCustomersCSV(customers){
   exportToCSV(`clientes_${new Date().toISOString().slice(0,10)}.csv`, headers, rows);
 }
 
-function ClientsScreen({onOpenClientRentals, pushToast}){
+function ClientsScreen({rentals, onOpenRental, pushToast}){
   const [customers, setCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState(null); // customer object ou {} pra novo
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleting, setDeleting] = useState(false);
+  const [historyCustomer, setHistoryCustomer] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1415,6 +1416,12 @@ function ClientsScreen({onOpenClientRentals, pushToast}){
   }, [pushToast]);
 
   useEffect(() => { load(); }, [load]);
+
+  function rentalsOf(customer){
+    return rentals
+      .filter(r => (r.customerId && r.customerId === customer.id) || (customer.document && customer.document.trim() && r.document === customer.document))
+      .sort((a,b)=> new Date(b.rentalDate||b.createdAt) - new Date(a.rentalDate||a.createdAt));
+  }
 
   const filtered = customers.filter(c => {
     const q = query.trim().toLowerCase();
@@ -1447,29 +1454,76 @@ function ClientsScreen({onOpenClientRentals, pushToast}){
         <Card><EmptyState icon="👥" title="Nenhum cliente cadastrado" message="Clientes aparecem aqui automaticamente quando você cadastra uma locação — ou cadastre um manualmente." actionLabel="+ Novo Cliente" onAction={()=>setEditing({})} /></Card>
       ) : (
         <div style={{display:'flex', flexDirection:'column', gap:10}}>
-          {filtered.map(c => (
-            <Card key={c.id}>
-              <div style={{display:'flex', justifyContent:'space-between', gap:10, flexWrap:'wrap'}}>
-                <div style={{minWidth:0}}>
-                  <div style={{fontWeight:700, fontSize:15}}>{c.name}</div>
-                  <div style={{fontSize:13, color:'var(--ink-soft)', marginTop:2}}>{[c.phone, c.document].filter(Boolean).join(' · ') || 'Sem telefone/documento'}</div>
-                  {c.email && <div style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:2}}>{c.email}</div>}
+          {filtered.map(c => {
+            const history = rentalsOf(c);
+            return (
+              <Card key={c.id}>
+                <div style={{display:'flex', justifyContent:'space-between', gap:10, flexWrap:'wrap'}}>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontWeight:700, fontSize:15}}>{c.name}</div>
+                    <div style={{fontSize:13, color:'var(--ink-soft)', marginTop:2}}>{[c.phone, c.document].filter(Boolean).join(' · ') || 'Sem telefone/documento'}</div>
+                    {c.email && <div style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:2}}>{c.email}</div>}
+                    <div style={{marginTop:8}}>
+                      {history.length === 0 ? (
+                        <span style={{fontSize:12, color:'var(--ink-soft)'}}>Nenhuma locação registrada ainda</span>
+                      ) : (
+                        <span style={{fontSize:12, fontWeight:700, color:'var(--safety-dark)', background:'#FBEADD', padding:'3px 9px', borderRadius:20}}>
+                          🏗️ {history.length} locação{history.length>1?'ões':''} · última em {formatDate(history[0].rentalDate)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{display:'flex', gap:8, flexShrink:0}}>
+                    <button onClick={()=>setHistoryCustomer(c)} disabled={history.length===0} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid var(--steel-line)', background:'#fff', fontSize:12.5, fontWeight:600, opacity:history.length===0?.5:1}}>📜 Histórico</button>
+                    <button onClick={()=>setEditing(c)} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid var(--steel-line)', background:'#fff', fontSize:12.5, fontWeight:600}}>✏️ Editar</button>
+                    <button onClick={()=>setDeleteTarget(c)} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontSize:12.5, fontWeight:600}}>🗑️</button>
+                  </div>
                 </div>
-                <div style={{display:'flex', gap:8}}>
-                  <button onClick={()=>setEditing(c)} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid var(--steel-line)', background:'#fff', fontSize:12.5, fontWeight:600}}>✏️ Editar</button>
-                  <button onClick={()=>setDeleteTarget(c)} className="focus-ring" style={{padding:'8px 12px', borderRadius:7, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontSize:12.5, fontWeight:600}}>🗑️</button>
-                </div>
-              </div>
-            </Card>
-          ))}
+              </Card>
+            );
+          })}
         </div>
       )}
 
       {editing && <ClientEditModal customer={editing} onClose={()=>setEditing(null)} onSaved={()=>{ setEditing(null); load(); }} pushToast={pushToast} />}
 
+      {historyCustomer && (
+        <ClientHistoryModal customer={historyCustomer} rentals={rentalsOf(historyCustomer)} onClose={()=>setHistoryCustomer(null)}
+          onOpenRental={(id)=>{ setHistoryCustomer(null); onOpenRental(id); }} />
+      )}
+
       <ConfirmModal open={!!deleteTarget} busy={deleting} title="Remover cliente"
         message={deleteTarget ? `Remover "${deleteTarget.name}" do cadastro de clientes? As locações já registradas para ele NÃO são apagadas, só o atalho de preenchimento automático.` : ''}
         confirmLabel="Remover" onConfirm={handleDelete} onCancel={()=>setDeleteTarget(null)} />
+    </div>
+  );
+}
+
+function ClientHistoryModal({customer, rentals, onClose, onOpenRental}){
+  return (
+    <div style={{position:'fixed', inset:0, background:'rgba(28,33,38,.55)', zIndex:150, display:'flex', alignItems:'center', justifyContent:'center', padding:16}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} className="fade-in" style={{background:'#fff', borderRadius:14, maxWidth:520, width:'100%', padding:24, boxShadow:'0 20px 60px rgba(0,0,0,.3)', maxHeight:'85vh', display:'flex', flexDirection:'column'}}>
+        <div style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:4}}>
+          <div>
+            <h3 style={{margin:0, fontSize:18}}>{customer.name}</h3>
+            <div style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:2}}>{rentals.length} locação{rentals.length>1?'ões':''} no histórico</div>
+          </div>
+          <button onClick={onClose} className="focus-ring" style={{background:'none', border:'none', fontSize:20, opacity:.6}}>✕</button>
+        </div>
+        <div style={{overflowY:'auto', marginTop:14, display:'flex', flexDirection:'column', gap:8}}>
+          {rentals.map(r => (
+            <button key={r.id} onClick={()=>onOpenRental(r.id)} className="focus-ring" style={{textAlign:'left', border:'1px solid var(--steel-line)', borderRadius:9, padding:12, background:'#fff'}}>
+              <div style={{display:'flex', justifyContent:'space-between', gap:10, alignItems:'center', flexWrap:'wrap'}}>
+                <div>
+                  <div style={{fontWeight:700, fontSize:13.5}}>{formatDate(r.rentalDate)} {r.expectedReturnDate ? `→ ${formatDate(r.expectedReturnDate)}` : ''}</div>
+                  <div style={{fontSize:12, color:'var(--ink-soft)', marginTop:2}}>{r.items.map(i=>i.equipmentType).filter(Boolean).join(', ') || 'Sem itens registrados'}</div>
+                </div>
+                <StatusBadge status={r.status} />
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1774,7 +1828,7 @@ function App(){
   } else if(screen === 'details' && activeRentalId){
     content = activeRental ? <RentalDetails rental={activeRental} onBack={()=>navigate('rentals')} onEdit={()=>{setEditingRentalId(activeRental.id); setEditingRental(activeRental); setScreen('form');}} onDeleteRequest={requestDelete} onStatusChanged={async ()=>{ const r = await rentalService.get(activeRental.id); setActiveRental(r); refresh(); }} pushToast={push} /> : <Spinner label="Carregando locação…" />;
   } else if(screen === 'clients'){
-    content = <ClientsScreen pushToast={push} />;
+    content = <ClientsScreen rentals={rentals} onOpenRental={(id)=>openRental(id)} pushToast={push} />;
   } else if(screen === 'settings'){
     content = <SettingsScreen pushToast={push} />;
   }
