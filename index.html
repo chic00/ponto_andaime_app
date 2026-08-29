@@ -144,6 +144,33 @@ const equipmentTypeService = {
       throw error;
     }
     return { id:data.id, name:data.name };
+  },
+  /* Junta 2+ tipos num só nome final. Atualiza todos os itens de locação
+     que usavam os nomes antigos, e limpa o catálogo dos tipos que sobraram
+     redundantes. Não apaga nenhuma locação nem item, só o texto do tipo. */
+  async merge(selected, finalName){
+    const finalTrim = finalName.trim();
+    if(!finalTrim) throw new Error('Informe o nome final do tipo.');
+    const oldNames = selected.map(s => s.name).filter(n => n !== finalTrim);
+    if(oldNames.length){
+      const { error: updErr } = await sb.from('rental_items').update({ equipment_type: finalTrim }).in('equipment_type', oldNames);
+      if(updErr) throw updErr;
+    }
+    const { data: existing } = await sb.from('equipment_types').select('id').eq('name', finalTrim).maybeSingle();
+    if(!existing){
+      const { data: userData } = await sb.auth.getUser();
+      const { error: insErr } = await sb.from('equipment_types').insert({ owner:userData.user.id, name:finalTrim });
+      if(insErr) throw insErr;
+    }
+    const idsToDelete = selected.filter(s => s.name !== finalTrim).map(s => s.id);
+    if(idsToDelete.length){
+      const { error: delErr } = await sb.from('equipment_types').delete().in('id', idsToDelete);
+      if(delErr) throw delErr;
+    }
+  },
+  async remove(id){
+    const { error } = await sb.from('equipment_types').delete().eq('id', id);
+    if(error) throw error;
   }
 };
 
@@ -197,6 +224,10 @@ const rentalService = {
       await sb.storage.from(PHOTOS_BUCKET).remove(photos.map(p => p.storage_path));
     }
     const { error } = await sb.from('rentals').delete().eq('id', id);
+    if(error) throw error;
+  },
+  async setManualStatus(id, status){
+    const { error } = await sb.from('rentals').update({ manual_status: status, updated_at: new Date().toISOString() }).eq('id', id);
     if(error) throw error;
   }
 };
@@ -423,6 +454,24 @@ function formatDate(d){
   const dt = new Date(d + 'T00:00:00');
   if(isNaN(dt)) return d;
   return dt.toLocaleDateString('pt-BR');
+}
+
+/* Gera um CSV com BOM UTF-8 (pra acentuação abrir certo no Excel) e
+   dispara o download direto no navegador — nada sai do dispositivo. */
+function exportToCSV(filename, headers, rows){
+  function escapeCell(value){
+    const str = value === null || value === undefined ? '' : String(value);
+    if(/[",;\n]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
+    return str;
+  }
+  const lines = [headers.map(escapeCell).join(';'), ...rows.map(row => row.map(escapeCell).join(';'))];
+  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 const STATUS_META = {
@@ -689,6 +738,9 @@ function Dashboard({rentals, onNavigate, onOpenRental}){
   const recentCount = rentals.filter(r => (Date.now() - new Date(r.createdAt).getTime()) < 1000*60*60*24*7).length;
   const uniqueClients = new Set(rentals.map(r=>r.customerName.trim().toLowerCase())).size;
   const recent = [...rentals].sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt)).slice(0,5);
+  const upcoming = rentals.filter(r => r.status === 'vencida' || r.status === 'proxima')
+    .sort((a,b)=> new Date(a.expectedReturnDate||'9999-12-31') - new Date(b.expectedReturnDate||'9999-12-31'))
+    .slice(0,6);
   const cards = [
     { label:'Total de clientes', value:uniqueClients, icon:'👥' }, { label:'Total de locações', value:total, icon:'🏗️' },
     { label:'Locações ativas', value:active, icon:'🟢' }, { label:'Cadastradas na semana', value:recentCount, icon:'🆕' },
@@ -704,6 +756,26 @@ function Dashboard({rentals, onNavigate, onOpenRental}){
           </Card>
         ))}
       </div>
+
+      {upcoming.length > 0 && (
+        <div style={{marginBottom:24}}>
+          <h2 style={{fontSize:16, margin:'0 0 12px'}}>⏰ Vencimentos próximos</h2>
+          <div style={{display:'flex', flexDirection:'column', gap:10}}>
+            {upcoming.map(r => (
+              <Card key={r.id} style={{cursor:'pointer', borderLeft: r.status==='vencida' ? '4px solid var(--danger)' : '4px solid var(--warn)'}}>
+                <div onClick={()=>onOpenRental(r.id)} style={{display:'flex', justifyContent:'space-between', gap:12, alignItems:'center', flexWrap:'wrap'}}>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontWeight:700, fontSize:15}}>{r.customerName}</div>
+                    <div style={{fontSize:13, color:'var(--ink-soft)', marginTop:2}}>Devolução: {formatDate(r.expectedReturnDate)} · {[r.city,r.state].filter(Boolean).join('/') || 'Local não informado'}</div>
+                  </div>
+                  <StatusBadge status={r.status} />
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12}}>
         <h2 style={{fontSize:16, margin:0}}>Locações recentes</h2>
         <button onClick={()=>onNavigate('new')} className="focus-ring" style={{background:'var(--safety)', color:'#fff', border:'none', padding:'10px 18px', borderRadius:8, fontWeight:700, fontSize:13.5}}>+ Nova Locação</button>
@@ -735,6 +807,18 @@ function Dashboard({rentals, onNavigate, onOpenRental}){
 /* =========================================================================
    LISTAGEM
    ========================================================================= */
+function exportRentalsCSV(rentals){
+  const headers = ['Cliente','CPF/CNPJ','Telefone','WhatsApp','E-mail','Data da locação','Devolução prevista','Status','Itens','Endereço','Bairro','Cidade','Estado','CEP','Link localização','Qtd. fotos','Observações'];
+  const rows = rentals.map(r => [
+    r.customerName, r.document, r.phone, r.whatsapp, r.email, formatDate(r.rentalDate), formatDate(r.expectedReturnDate),
+    STATUS_META[r.status]?.label || r.status,
+    r.items.map(i => `${i.equipmentType}${i.quantity ? ' ('+i.quantity+')' : ''}`).join(' | '),
+    [r.address, r.number].filter(Boolean).join(', '), r.neighborhood, r.city, r.state, r.zipCode,
+    r.locationUrl, r.photos.length, r.rentalNotes
+  ]);
+  exportToCSV(`locacoes_${new Date().toISOString().slice(0,10)}.csv`, headers, rows);
+}
+
 function RentalsList({rentals, onOpenRental, onNavigate, onDeleteRequest}){
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('todos');
@@ -762,6 +846,7 @@ function RentalsList({rentals, onOpenRental, onNavigate, onDeleteRequest}){
         <Select value={cityFilter} onChange={e=>setCityFilter(e.target.value)} style={{width:'auto'}}>
           <option value="todos">Todas as cidades</option>{cities.map(c => <option key={c} value={c}>{c}</option>)}
         </Select>
+        <button onClick={()=>exportRentalsCSV(filtered)} disabled={filtered.length===0} className="focus-ring" title="Exportar locações filtradas para CSV/Excel" style={{padding:'11px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13.5, opacity:filtered.length===0?.5:1}}>📤 Exportar CSV</button>
         <button onClick={()=>onNavigate('new')} className="focus-ring hidden md:inline-flex" style={{background:'var(--safety)', color:'#fff', border:'none', padding:'11px 18px', borderRadius:8, fontWeight:700, fontSize:13.5}}>+ Nova Locação</button>
       </div>
 
@@ -1177,10 +1262,22 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
 /* =========================================================================
    DETALHES
    ========================================================================= */
-function RentalDetails({rental, onBack, onEdit, onDeleteRequest, pushToast}){
+function RentalDetails({rental, onBack, onEdit, onDeleteRequest, onStatusChanged, pushToast}){
   const [lightbox, setLightbox] = useState(null);
   const [urls, setUrls] = useState({});
   const [loadingPhotos, setLoadingPhotos] = useState(true);
+  const [updatingStatus, setUpdatingStatus] = useState(false);
+
+  async function toggleEncerrada(){
+    setUpdatingStatus(true);
+    try{
+      const novoStatus = rental.manualStatus === 'encerrada' ? null : 'encerrada';
+      await rentalService.setManualStatus(rental.id, novoStatus);
+      pushToast(novoStatus ? 'Locação marcada como encerrada.' : 'Locação reaberta.', 'success');
+      onStatusChanged();
+    }catch(err){ pushToast('Erro ao atualizar status: ' + err.message, 'error'); }
+    finally{ setUpdatingStatus(false); }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -1203,7 +1300,10 @@ function RentalDetails({rental, onBack, onEdit, onDeleteRequest, pushToast}){
     <div className="fade-in" style={{display:'flex', flexDirection:'column', gap:16, paddingBottom:30}}>
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10}}>
         <button onClick={onBack} className="focus-ring" style={{background:'none', border:'none', fontSize:13.5, fontWeight:700, color:'var(--steel)'}}>← Voltar para locações</button>
-        <div style={{display:'flex', gap:8}}>
+        <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+          <button onClick={toggleEncerrada} disabled={updatingStatus} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13, opacity:updatingStatus?.7:1}}>
+            {rental.manualStatus === 'encerrada' ? '🔓 Reabrir locação' : '✅ Marcar como encerrada'}
+          </button>
           <button onClick={onEdit} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13}}>✏️ Editar locação</button>
           <button onClick={()=>onDeleteRequest(rental)} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontWeight:700, fontSize:13}}>🗑️ Excluir</button>
         </div>
@@ -1293,6 +1393,12 @@ function DetailItem({label, value, block, link}){
 /* =========================================================================
    CLIENTES
    ========================================================================= */
+function exportCustomersCSV(customers){
+  const headers = ['Nome','CPF/CNPJ','Telefone','WhatsApp','E-mail','Observações'];
+  const rows = customers.map(c => [c.name, c.document, c.phone, c.whatsapp, c.email, c.notes]);
+  exportToCSV(`clientes_${new Date().toISOString().slice(0,10)}.csv`, headers, rows);
+}
+
 function ClientsScreen({onOpenClientRentals, pushToast}){
   const [customers, setCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1333,6 +1439,7 @@ function ClientsScreen({onOpenClientRentals, pushToast}){
           <span style={{position:'absolute', left:12, top:11.5, opacity:.5}}>🔎</span>
           <Input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Pesquisar por nome, telefone ou documento..." style={{paddingLeft:36}} />
         </div>
+        <button onClick={()=>exportCustomersCSV(filtered)} disabled={filtered.length===0} className="focus-ring" title="Exportar clientes filtrados para CSV/Excel" style={{padding:'11px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13.5, opacity:filtered.length===0?.5:1}}>📤 Exportar CSV</button>
         <button onClick={()=>setEditing({})} className="focus-ring" style={{background:'var(--safety)', color:'#fff', border:'none', padding:'11px 18px', borderRadius:8, fontWeight:700, fontSize:13.5}}>+ Novo Cliente</button>
       </div>
 
@@ -1492,7 +1599,89 @@ function SettingsScreen({pushToast}){
         message={candidates ? `Confirma apagar ${candidates.reduce((s,c)=>s+c.photoCount,0)} foto(s) de ${candidates.length} locação(ões)? As locações continuam no histórico, só as fotos somem. Isso não pode ser desfeito.` : ''}
         confirmLabel="Apagar fotos" onConfirm={runCleanup} onCancel={()=>setConfirmCleanup(false)} />
     </Card>
+
+    <EquipmentTypesCard pushToast={pushToast} />
     </div>
+  );
+}
+
+function EquipmentTypesCard({pushToast}){
+  const [types, setTypes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [merging, setMerging] = useState(false);
+  const [mergeModalOpen, setMergeModalOpen] = useState(false);
+  const [finalName, setFinalName] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try{ setTypes(await equipmentTypeService.list()); }
+    catch(err){ pushToast('Erro ao carregar tipos: ' + err.message, 'error'); }
+    finally{ setLoading(false); }
+  }, [pushToast]);
+  useEffect(() => { load(); }, [load]);
+
+  function toggle(id){
+    setSelectedIds(ids => ids.includes(id) ? ids.filter(x=>x!==id) : [...ids, id]);
+  }
+  function openMergeModal(){
+    const selected = types.filter(t => selectedIds.includes(t.id));
+    setFinalName(selected[0]?.name || '');
+    setMergeModalOpen(true);
+  }
+  async function confirmMerge(){
+    const selected = types.filter(t => selectedIds.includes(t.id));
+    setMerging(true);
+    try{
+      await equipmentTypeService.merge(selected, finalName);
+      pushToast(`${selected.length} tipos mesclados em "${finalName.trim()}".`, 'success');
+      setSelectedIds([]); setMergeModalOpen(false);
+      load();
+    }catch(err){ pushToast('Erro ao mesclar: ' + err.message, 'error'); }
+    finally{ setMerging(false); }
+  }
+
+  return (
+    <Card style={{maxWidth:560}}>
+      <h2 style={{fontSize:15, margin:'0 0 6px'}}>🏗️ Tipos de andaime</h2>
+      <p style={{fontSize:12.5, color:'var(--ink-soft)', margin:'0 0 16px', textTransform:'none', lineHeight:1.5}}>
+        Selecione 2 ou mais tipos "parecidos" (ex.: escritos com maiúscula diferente ou espaço a mais) para juntá-los num só. Locações antigas que usavam os tipos antigos passam a mostrar o nome final.
+      </p>
+      {loading ? <Spinner label="Carregando tipos…" /> : types.length === 0 ? (
+        <div style={{fontSize:13, color:'var(--ink-soft)'}}>Nenhum tipo cadastrado ainda.</div>
+      ) : (
+        <div style={{display:'flex', flexDirection:'column', gap:6, marginBottom:14, maxHeight:260, overflowY:'auto'}}>
+          {types.map(t => (
+            <label key={t.id} style={{display:'flex', alignItems:'center', gap:10, padding:'8px 10px', borderRadius:7, background: selectedIds.includes(t.id) ? 'var(--concrete)' : 'transparent', cursor:'pointer'}}>
+              <input type="checkbox" checked={selectedIds.includes(t.id)} onChange={()=>toggle(t.id)} />
+              <span style={{fontSize:13.5}}>{t.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+      <button type="button" onClick={openMergeModal} disabled={selectedIds.length < 2} className="focus-ring" style={{padding:'10px 18px', borderRadius:8, border:'none', background: selectedIds.length<2 ? '#DADFE2' : 'var(--safety)', color:'#fff', fontWeight:700, fontSize:13.5}}>
+        🔗 Mesclar selecionados ({selectedIds.length})
+      </button>
+
+      {mergeModalOpen && (
+        <div style={{position:'fixed', inset:0, background:'rgba(28,33,38,.55)', zIndex:150, display:'flex', alignItems:'center', justifyContent:'center', padding:16}} onClick={()=>setMergeModalOpen(false)}>
+          <div onClick={e=>e.stopPropagation()} className="fade-in" style={{background:'#fff', borderRadius:12, maxWidth:420, width:'100%', padding:24, boxShadow:'0 20px 60px rgba(0,0,0,.3)'}}>
+            <h3 style={{margin:'0 0 8px', fontSize:17}}>Mesclar tipos</h3>
+            <p style={{margin:'0 0 14px', fontSize:13, color:'var(--ink-soft)', textTransform:'none', lineHeight:1.5}}>
+              {types.filter(t=>selectedIds.includes(t.id)).map(t=>t.name).join(', ')} vão virar um só. Escolha (ou digite) o nome final:
+            </p>
+            <Input value={finalName} onChange={e=>setFinalName(e.target.value)} list="merge-suggestions" />
+            <datalist id="merge-suggestions">
+              {types.filter(t=>selectedIds.includes(t.id)).map(t => <option key={t.id} value={t.name} />)}
+            </datalist>
+            <div style={{display:'flex', gap:10, justifyContent:'flex-end', marginTop:18}}>
+              <button onClick={()=>setMergeModalOpen(false)} className="focus-ring" style={{padding:'10px 18px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:600}}>Cancelar</button>
+              <button onClick={confirmMerge} disabled={merging} className="focus-ring" style={{padding:'10px 18px', borderRadius:8, border:'none', background:'var(--safety)', color:'#fff', fontWeight:700, opacity:merging?.7:1}}>{merging?'Mesclando…':'Confirmar'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -1583,7 +1772,7 @@ function App(){
   } else if(screen === 'form' && editingRentalId){
     content = editingRental ? <RentalForm initial={editingRental} onCancel={()=>{setScreen('details');}} onSaved={handleSaved} pushToast={push} /> : <Spinner label="Carregando locação…" />;
   } else if(screen === 'details' && activeRentalId){
-    content = activeRental ? <RentalDetails rental={activeRental} onBack={()=>navigate('rentals')} onEdit={()=>{setEditingRentalId(activeRental.id); setEditingRental(activeRental); setScreen('form');}} onDeleteRequest={requestDelete} pushToast={push} /> : <Spinner label="Carregando locação…" />;
+    content = activeRental ? <RentalDetails rental={activeRental} onBack={()=>navigate('rentals')} onEdit={()=>{setEditingRentalId(activeRental.id); setEditingRental(activeRental); setScreen('form');}} onDeleteRequest={requestDelete} onStatusChanged={async ()=>{ const r = await rentalService.get(activeRental.id); setActiveRental(r); refresh(); }} pushToast={push} /> : <Spinner label="Carregando locação…" />;
   } else if(screen === 'clients'){
     content = <ClientsScreen pushToast={push} />;
   } else if(screen === 'settings'){
