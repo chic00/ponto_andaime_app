@@ -98,7 +98,8 @@ function rowToRental(row){
     id: row.id, customerName: row.customer_name, document: row.document || '', phone: row.phone || '',
     whatsapp: row.whatsapp || '', email: row.email || '', customerNotes: row.customer_notes || '',
     rentalDate: row.rental_date || '', expectedReturnDate: row.expected_return_date || '',
-    equipmentType: row.equipment_type || '', quantity: row.quantity || '', description: row.description || '',
+    items: (row.rental_items || []).map(i => ({ id:i.id, equipmentType:i.equipment_type, quantity:i.quantity || '' })),
+    description: row.description || '',
     rentalNotes: row.rental_notes || '', address: row.address || '', number: row.number || '',
     complement: row.complement || '', neighborhood: row.neighborhood || '', city: row.city || '',
     state: row.state || '', zipCode: row.zip_code || '', locationUrl: row.location_url || '',
@@ -110,7 +111,7 @@ function rentalToRow(form){
   return {
     customer_name: form.customerName, document: form.document, phone: form.phone, whatsapp: form.whatsapp,
     email: form.email, customer_notes: form.customerNotes, rental_date: form.rentalDate || null,
-    expected_return_date: form.expectedReturnDate || null, equipment_type: form.equipmentType, quantity: form.quantity,
+    expected_return_date: form.expectedReturnDate || null,
     description: form.description, rental_notes: form.rentalNotes, address: form.address, number: form.number,
     complement: form.complement, neighborhood: form.neighborhood, city: form.city, state: form.state,
     zip_code: form.zipCode, location_url: form.locationUrl
@@ -127,14 +128,44 @@ function computeStatus(r){
   return 'ativa';
 }
 
+const equipmentTypeService = {
+  async list(){
+    const { data, error } = await sb.from('equipment_types').select('*').order('name');
+    if(error) throw error;
+    return data.map(t => ({ id:t.id, name:t.name }));
+  },
+  async create(name){
+    const clean = name.trim();
+    if(!clean) throw new Error('Informe um nome para o tipo de andaime.');
+    const { data: userData } = await sb.auth.getUser();
+    const { data, error } = await sb.from('equipment_types').insert({ owner:userData.user.id, name:clean }).select().single();
+    if(error){
+      if(error.code === '23505') throw new Error('Esse tipo já está cadastrado.');
+      throw error;
+    }
+    return { id:data.id, name:data.name };
+  }
+};
+
+async function replaceRentalItems(rentalId, items){
+  const { error: delErr } = await sb.from('rental_items').delete().eq('rental_id', rentalId);
+  if(delErr) throw delErr;
+  const rows = (items || []).filter(i => i.equipmentType && i.equipmentType.trim())
+    .map(i => ({ rental_id: rentalId, equipment_type: i.equipmentType.trim(), quantity: i.quantity || '' }));
+  if(rows.length){
+    const { error } = await sb.from('rental_items').insert(rows);
+    if(error) throw error;
+  }
+}
+
 const rentalService = {
   async list(){
-    const { data, error } = await sb.from('rentals').select('*, photos(*)').order('created_at', { ascending:false });
+    const { data, error } = await sb.from('rentals').select('*, photos(*), rental_items(*)').order('created_at', { ascending:false });
     if(error) throw error;
     return data.map(rowToRental).map(r => ({...r, status: computeStatus(r)}));
   },
   async get(id){
-    const { data, error } = await sb.from('rentals').select('*, photos(*)').eq('id', id).maybeSingle();
+    const { data, error } = await sb.from('rentals').select('*, photos(*), rental_items(*)').eq('id', id).maybeSingle();
     if(error) throw error;
     if(!data) return null;
     const r = rowToRental(data);
@@ -144,17 +175,21 @@ const rentalService = {
     const { data: userData } = await sb.auth.getUser();
     const customerId = await customerService.upsertFromRentalForm(form, userData.user.id);
     const row = { ...rentalToRow(form), owner: userData.user.id, customer_id: customerId };
-    const { data, error } = await sb.from('rentals').insert(row).select('*, photos(*)').single();
+    const { data, error } = await sb.from('rentals').insert(row).select('*, photos(*), rental_items(*)').single();
     if(error) throw error;
-    return rowToRental(data);
+    await replaceRentalItems(data.id, form.items);
+    const { data: fresh } = await sb.from('rentals').select('*, photos(*), rental_items(*)').eq('id', data.id).single();
+    return rowToRental(fresh);
   },
   async update(id, form){
     const { data: userData } = await sb.auth.getUser();
     const customerId = await customerService.upsertFromRentalForm(form, userData.user.id);
     const row = { ...rentalToRow(form), customer_id: customerId, updated_at: new Date().toISOString() };
-    const { data, error } = await sb.from('rentals').update(row).eq('id', id).select('*, photos(*)').single();
+    const { data, error } = await sb.from('rentals').update(row).eq('id', id).select('*, photos(*), rental_items(*)').single();
     if(error) throw error;
-    return rowToRental(data);
+    await replaceRentalItems(id, form.items);
+    const { data: fresh } = await sb.from('rentals').select('*, photos(*), rental_items(*)').eq('id', id).single();
+    return rowToRental(fresh);
   },
   async remove(id){
     const { data: photos } = await sb.from('photos').select('storage_path').eq('rental_id', id);
@@ -737,7 +772,7 @@ function RentalsList({rentals, onOpenRental, onNavigate, onDeleteRequest}){
           <div className="hidden md:block" style={{background:'#fff', borderRadius:12, border:'1px solid #EDEAE2', overflow:'hidden'}}>
             <table style={{width:'100%', borderCollapse:'collapse', fontSize:13.5}}>
               <thead><tr style={{background:'var(--concrete)', textAlign:'left'}}>
-                {['Cliente','Telefone','Obra','Locação','Devolução','Qtd.','Fotos','Status','Ações'].map(h=>(
+                {['Cliente','Telefone','Obra','Locação','Devolução','Itens','Fotos','Status','Ações'].map(h=>(
                   <th key={h} style={{padding:'11px 14px', fontWeight:700, color:'var(--steel)', fontSize:11.5, textTransform:'uppercase', letterSpacing:'.03em'}}>{h}</th>
                 ))}
               </tr></thead>
@@ -749,7 +784,7 @@ function RentalsList({rentals, onOpenRental, onNavigate, onDeleteRequest}){
                     <td style={{padding:'12px 14px', color:'var(--ink-soft)'}}>{[r.city,r.state].filter(Boolean).join('/') || '—'}</td>
                     <td style={{padding:'12px 14px'}}>{formatDate(r.rentalDate)}</td>
                     <td style={{padding:'12px 14px'}}>{formatDate(r.expectedReturnDate)}</td>
-                    <td style={{padding:'12px 14px'}}>{r.quantity || '—'}</td>
+                    <td style={{padding:'12px 14px'}} title={r.items.map(i=>`${i.equipmentType} (${i.quantity||'sem qtd.'})`).join(', ')}>{r.items.length ? `${r.items.length} item(ns)` : '—'}</td>
                     <td style={{padding:'12px 14px'}}>{r.photos.length}</td>
                     <td style={{padding:'12px 14px'}}><StatusBadge status={r.status} /></td>
                     <td style={{padding:'12px 14px'}}>
@@ -795,13 +830,69 @@ function RentalsList({rentals, onOpenRental, onNavigate, onDeleteRequest}){
    ========================================================================= */
 const BRAZIL_STATES = ['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'];
 
+function EquipmentItemRow({item, index, catalog, onChange, onRemove, onTypeCreated, pushToast}){
+  const [adding, setAdding] = useState(false);
+  const [newTypeName, setNewTypeName] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  function handleSelect(value){
+    if(value === '__new__'){ setAdding(true); return; }
+    onChange(index, 'equipmentType', value);
+  }
+  async function confirmNewType(){
+    if(!newTypeName.trim()){ pushToast('Digite o nome do novo tipo.', 'error'); return; }
+    setCreating(true);
+    try{
+      const created = await equipmentTypeService.create(newTypeName);
+      onTypeCreated(created);
+      onChange(index, 'equipmentType', created.name);
+      setAdding(false); setNewTypeName('');
+      pushToast(`"${created.name}" cadastrado no catálogo.`, 'success');
+    }catch(err){ pushToast(err.message, 'error'); }
+    finally{ setCreating(false); }
+  }
+
+  if(adding){
+    return (
+      <div style={{display:'flex', gap:8, marginBottom:8, flexWrap:'wrap', alignItems:'center', background:'var(--concrete)', padding:10, borderRadius:8}}>
+        <Input autoFocus value={newTypeName} onChange={e=>setNewTypeName(e.target.value)} placeholder="Nome do novo tipo de andaime" style={{flex:'1 1 200px'}} />
+        <button type="button" onClick={confirmNewType} disabled={creating} className="focus-ring" style={{padding:'10px 14px', borderRadius:7, border:'none', background:'var(--safety)', color:'#fff', fontWeight:700, fontSize:13}}>{creating?'Salvando…':'✓ Cadastrar'}</button>
+        <button type="button" onClick={()=>{setAdding(false); setNewTypeName('');}} className="focus-ring" style={{padding:'10px 14px', borderRadius:7, border:'1px solid var(--steel-line)', background:'#fff', fontSize:13}}>Cancelar</button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{display:'flex', gap:8, marginBottom:8, alignItems:'flex-start', flexWrap:'wrap'}}>
+      <Select value={item.equipmentType} onChange={e=>handleSelect(e.target.value)} style={{flex:'2 1 200px'}}>
+        <option value="">Selecione o tipo...</option>
+        {catalog.map(t => <option key={t.id} value={t.name}>{t.name}</option>)}
+        {item.equipmentType && !catalog.some(t=>t.name===item.equipmentType) && <option value={item.equipmentType}>{item.equipmentType}</option>}
+        <option value="__new__">➕ Cadastrar novo tipo...</option>
+      </Select>
+      <Input value={item.quantity} onChange={e=>onChange(index, 'quantity', e.target.value)} placeholder="Qtd. (ex.: 20 torres)" style={{flex:'1 1 150px'}} />
+      {onRemove && <button type="button" onClick={()=>onRemove(index)} className="focus-ring" style={{padding:'11px 13px', borderRadius:8, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)'}}>🗑️</button>}
+    </div>
+  );
+}
+
 function RentalForm({initial, onCancel, onSaved, pushToast}){
   const isEdit = !!initial;
-  const [form, setForm] = useState(() => initial ? {...initial} : {
+  const [form, setForm] = useState(() => initial ? {...initial, items: initial.items && initial.items.length ? initial.items : [{ id:uid('itm'), equipmentType:'', quantity:'' }]} : {
     customerName:'', document:'', phone:'', whatsapp:'', email:'', customerNotes:'',
-    rentalDate: new Date().toISOString().slice(0,10), expectedReturnDate:'', equipmentType:'', quantity:'', description:'', rentalNotes:'',
+    rentalDate: new Date().toISOString().slice(0,10), expectedReturnDate:'', items:[{ id:uid('itm'), equipmentType:'', quantity:'' }], description:'', rentalNotes:'',
     address:'', number:'', complement:'', neighborhood:'', city:'', state:'', zipCode:'', locationUrl:''
   });
+  const [equipmentCatalog, setEquipmentCatalog] = useState([]);
+  useEffect(() => { equipmentTypeService.list().then(setEquipmentCatalog).catch(err => pushToast('Erro ao carregar tipos de andaime: ' + err.message, 'error')); }, []);
+  function updateItem(idx, field, value){
+    setForm(f => ({...f, items: f.items.map((it,i) => i===idx ? {...it, [field]:value} : it)}));
+  }
+  function addItem(){ setForm(f => ({...f, items:[...f.items, { id:uid('itm'), equipmentType:'', quantity:'' }]})); }
+  function removeItem(idx){ setForm(f => ({...f, items: f.items.filter((_,i)=>i!==idx)})); }
+  function handleTypeCreated(newType){
+    setEquipmentCatalog(c => [...c, newType].sort((a,b)=>a.name.localeCompare(b.name)));
+  }
   const [existingPhotos, setExistingPhotos] = useState(initial ? initial.photos : []);
   const [existingUrls, setExistingUrls] = useState({});
   const [pendingPhotos, setPendingPhotos] = useState([]); // {tempId, file, previewUrl, description}
@@ -812,17 +903,14 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
   const fileInputRef = useRef(null);
   const cameraInputRef = useRef(null);
   const [lightbox, setLightbox] = useState(null);
-  const [customerQuery, setCustomerQuery] = useState('');
   const [customerSuggestions, setCustomerSuggestions] = useState([]);
   const [searchingCustomer, setSearchingCustomer] = useState(false);
-  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [activeSearchField, setActiveSearchField] = useState(null); // 'name' | 'document' | null
   const customerSearchTimer = useRef(null);
 
-  function onCustomerNameChange(value){
-    set('customerName', value);
+  function triggerCustomerSearch(field, value){
     if(isEdit) return; // não sugere durante edição de uma locação já existente
-    setCustomerQuery(value);
-    setShowSuggestions(true);
+    setActiveSearchField(field);
     if(customerSearchTimer.current) clearTimeout(customerSearchTimer.current);
     if(!value || value.trim().length < 2){ setCustomerSuggestions([]); return; }
     customerSearchTimer.current = setTimeout(async () => {
@@ -832,11 +920,27 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
       finally{ setSearchingCustomer(false); }
     }, 350);
   }
+  function onCustomerNameChange(value){ set('customerName', value); triggerCustomerSearch('name', value); }
+  function onCustomerDocumentChange(value){ const masked = maskDocument(value); set('document', masked); triggerCustomerSearch('document', masked); }
   function pickCustomer(c){
     setForm(f => ({...f, customerName:c.name, document:c.document||'', phone:c.phone||'', whatsapp:c.whatsapp||'', email:c.email||'', customerNotes:c.notes||''}));
-    setShowSuggestions(false);
+    setActiveSearchField(null);
     setCustomerSuggestions([]);
     pushToast(`Dados de "${c.name}" preenchidos automaticamente.`, 'success');
+  }
+  function CustomerSuggestionsList(){
+    return (
+      <div style={{position:'absolute', top:'100%', left:0, right:0, background:'#fff', border:'1px solid var(--steel-line)', borderRadius:8, marginTop:4, boxShadow:'0 8px 20px rgba(0,0,0,.12)', zIndex:10, maxHeight:220, overflowY:'auto'}}>
+        {searchingCustomer ? (
+          <div style={{padding:'10px 12px', fontSize:12.5, color:'var(--ink-soft)'}}>Buscando…</div>
+        ) : customerSuggestions.map(c => (
+          <button type="button" key={c.id} onMouseDown={()=>pickCustomer(c)} className="focus-ring" style={{display:'block', width:'100%', textAlign:'left', padding:'10px 12px', border:'none', background:'none', borderBottom:'1px solid #F0EEE8'}}>
+            <div style={{fontWeight:700, fontSize:13.5}}>{c.name}</div>
+            <div style={{fontSize:11.5, color:'var(--ink-soft)'}}>{[c.phone, c.document].filter(Boolean).join(' · ') || 'Cliente cadastrado'}</div>
+          </button>
+        ))}
+      </div>
+    );
   }
 
   useEffect(() => {
@@ -915,7 +1019,7 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
 
   function clearForm(){
     setForm({ customerName:'', document:'', phone:'', whatsapp:'', email:'', customerNotes:'',
-      rentalDate: new Date().toISOString().slice(0,10), expectedReturnDate:'', equipmentType:'', quantity:'', description:'', rentalNotes:'',
+      rentalDate: new Date().toISOString().slice(0,10), expectedReturnDate:'', items:[{ id:uid('itm'), equipmentType:'', quantity:'' }], description:'', rentalNotes:'',
       address:'', number:'', complement:'', neighborhood:'', city:'', state:'', zipCode:'', locationUrl:'' });
     setPendingPhotos([]); setErrors({});
   }
@@ -931,24 +1035,18 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
         <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(220px,1fr))', gap:0}}>
           <Field label="Nome completo / Razão social" required>
             <div style={{position:'relative'}}>
-              <Input value={form.customerName} onChange={e=>onCustomerNameChange(e.target.value)} onFocus={()=>setShowSuggestions(true)} onBlur={()=>setTimeout(()=>setShowSuggestions(false),150)} placeholder="Ex.: Construtora Vale Verde Ltda" autoComplete="off" />
-              {showSuggestions && (searchingCustomer || customerSuggestions.length > 0) && (
-                <div style={{position:'absolute', top:'100%', left:0, right:0, background:'#fff', border:'1px solid var(--steel-line)', borderRadius:8, marginTop:4, boxShadow:'0 8px 20px rgba(0,0,0,.12)', zIndex:10, maxHeight:220, overflowY:'auto'}}>
-                  {searchingCustomer ? (
-                    <div style={{padding:'10px 12px', fontSize:12.5, color:'var(--ink-soft)'}}>Buscando…</div>
-                  ) : customerSuggestions.map(c => (
-                    <button type="button" key={c.id} onMouseDown={()=>pickCustomer(c)} className="focus-ring" style={{display:'block', width:'100%', textAlign:'left', padding:'10px 12px', border:'none', background:'none', borderBottom:'1px solid #F0EEE8'}}>
-                      <div style={{fontWeight:700, fontSize:13.5}}>{c.name}</div>
-                      <div style={{fontSize:11.5, color:'var(--ink-soft)'}}>{[c.phone, c.document].filter(Boolean).join(' · ') || 'Cliente cadastrado'}</div>
-                    </button>
-                  ))}
-                </div>
-              )}
+              <Input value={form.customerName} onChange={e=>onCustomerNameChange(e.target.value)} onFocus={()=>setActiveSearchField('name')} onBlur={()=>setTimeout(()=>setActiveSearchField(f=>f==='name'?null:f),150)} placeholder="Ex.: Construtora Vale Verde Ltda" autoComplete="off" />
+              {activeSearchField==='name' && (searchingCustomer || customerSuggestions.length > 0) && <CustomerSuggestionsList />}
             </div>
-            <span style={{display:'block', fontSize:11.5, color:'var(--ink-soft)', marginTop:4, textTransform:'none'}}>Já cadastrado antes? Comece a digitar o nome — os dados preenchem sozinhos.</span>
+            <span style={{display:'block', fontSize:11.5, color:'var(--ink-soft)', marginTop:4, textTransform:'none'}}>Já cadastrado antes? Comece a digitar o nome ou o CPF/CNPJ — os dados preenchem sozinhos.</span>
             {errors.customerName && <span style={{color:'var(--danger)', fontSize:12}}>{errors.customerName}</span>}
           </Field>
-          <Field label="CPF / CNPJ"><Input value={form.document} onChange={e=>set('document', maskDocument(e.target.value))} placeholder="000.000.000-00" /></Field>
+          <Field label="CPF / CNPJ">
+            <div style={{position:'relative'}}>
+              <Input value={form.document} onChange={e=>onCustomerDocumentChange(e.target.value)} onFocus={()=>setActiveSearchField('document')} onBlur={()=>setTimeout(()=>setActiveSearchField(f=>f==='document'?null:f),150)} placeholder="000.000.000-00" autoComplete="off" />
+              {activeSearchField==='document' && (searchingCustomer || customerSuggestions.length > 0) && <CustomerSuggestionsList />}
+            </div>
+          </Field>
           <Field label="Telefone" required>
             <Input value={form.phone} onChange={e=>set('phone', maskPhone(e.target.value))} placeholder="(00) 00000-0000" />
             {errors.phone && <span style={{color:'var(--danger)', fontSize:12}}>{errors.phone}</span>}
@@ -970,14 +1068,16 @@ function RentalForm({initial, onCancel, onSaved, pushToast}){
             {errors.rentalDate && <span style={{color:'var(--danger)', fontSize:12}}>{errors.rentalDate}</span>}
           </Field>
           <Field label="Devolução prevista"><Input type="date" value={form.expectedReturnDate} onChange={e=>set('expectedReturnDate', e.target.value)} /></Field>
-          <Field label="Tipo de andaime">
-            <Select value={form.equipmentType} onChange={e=>set('equipmentType', e.target.value)}>
-              <option value="">Selecione...</option><option>Andaime tubular</option><option>Andaime fachadeiro</option>
-              <option>Andaime torre</option><option>Andaime suspenso</option><option>Outro</option>
-            </Select>
-          </Field>
-          <Field label="Quantidade"><Input value={form.quantity} onChange={e=>set('quantity', e.target.value)} placeholder="Ex.: 20 torres" /></Field>
         </div>
+
+        <span style={{display:'block', fontSize:12.5, fontWeight:700, color:'var(--steel)', marginBottom:8, letterSpacing:'.02em'}}>Itens da locação</span>
+        {form.items.map((item, idx) => (
+          <EquipmentItemRow key={item.id} item={item} index={idx} catalog={equipmentCatalog}
+            onChange={updateItem} onRemove={form.items.length > 1 ? removeItem : null}
+            onTypeCreated={handleTypeCreated} pushToast={pushToast} />
+        ))}
+        <button type="button" onClick={addItem} className="focus-ring" style={{marginBottom:16, padding:'9px 16px', borderRadius:8, border:'1px dashed var(--steel-line)', background:'var(--concrete)', fontWeight:600, fontSize:13}}>+ Adicionar item</button>
+
         <Field label="Descrição dos equipamentos"><Textarea value={form.description} onChange={e=>set('description', e.target.value)} placeholder="Detalhes técnicos, altura, área coberta..." /></Field>
         <Field label="Observações da locação"><Textarea value={form.rentalNotes} onChange={e=>set('rentalNotes', e.target.value)} placeholder="Condições combinadas, prazos, etc." /></Field>
       </Card>
@@ -1124,12 +1224,18 @@ function RentalDetails({rental, onBack, onEdit, onDeleteRequest, pushToast}){
 
       <Card>
         <h3 style={{fontSize:14, margin:'0 0 14px', color:'var(--steel)'}}>🏗️ Dados da locação</h3>
-        <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))', gap:14}}>
+        <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))', gap:14, marginBottom:14}}>
           <DetailItem label="Data da locação" value={formatDate(rental.rentalDate)} />
           <DetailItem label="Devolução prevista" value={formatDate(rental.expectedReturnDate)} />
-          <DetailItem label="Tipo de andaime" value={rental.equipmentType} />
-          <DetailItem label="Quantidade" value={rental.quantity} />
         </div>
+        <div style={{fontSize:11.5, fontWeight:700, color:'var(--steel)', textTransform:'uppercase', letterSpacing:'.03em', marginBottom:6}}>Itens</div>
+        {rental.items.length === 0 ? (
+          <div style={{fontSize:13.5, color:'var(--ink-soft)'}}>Nenhum item registrado.</div>
+        ) : (
+          <ul style={{margin:'0 0 4px', paddingLeft:18, fontSize:14.5}}>
+            {rental.items.map(i => (<li key={i.id}>{i.equipmentType}{i.quantity ? ` — ${i.quantity}` : ''}</li>))}
+          </ul>
+        )}
         {rental.description && <DetailItem label="Descrição dos equipamentos" value={rental.description} block />}
         {rental.rentalNotes && <DetailItem label="Observações da locação" value={rental.rentalNotes} block />}
       </Card>
