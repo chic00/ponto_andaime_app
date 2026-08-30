@@ -478,7 +478,11 @@ function formatDate(d){
    dispara o download direto no navegador — nada sai do dispositivo. */
 function exportToCSV(filename, headers, rows){
   function escapeCell(value){
-    const str = value === null || value === undefined ? '' : String(value);
+    let str = value === null || value === undefined ? '' : String(value);
+    // Neutraliza "injeção de fórmula": se o Excel/Sheets abrir esse CSV e o
+    // valor começar com =, +, -, @ ou tab, ele pode tentar executar como
+    // fórmula em vez de mostrar como texto. Um apóstrofo na frente resolve.
+    if(/^[=+\-@\t\r]/.test(str)) str = "'" + str;
     if(/[",;\n]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
     return str;
   }
