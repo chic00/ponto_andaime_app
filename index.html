@@ -46,26 +46,17 @@
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
 /* =========================================================================
-   CONFIGURAÇÃO — cole aqui os dados do seu projeto Supabase
-   (Project Settings > API, no painel do Supabase)
-
-   No sistema novo de chaves da Supabase:
-     url     = SUPABASE_URL
-     anonKey = SUPABASE_PUBLISHABLE_KEY   (equivalente à antiga "anon key")
-
-   IMPORTANTE: NUNCA cole aqui a SUPABASE_SECRET_KEY (antiga "service_role").
-   Essa chave ignora todas as regras de segurança (RLS) do banco. Colá-la
-   num arquivo HTML que roda no navegador equivale a deixar a porta dos
-   fundos do banco de dados destrancada para qualquer visitante.
+   CONFIGURAÇÃO — as credenciais do Supabase NÃO ficam mais escritas aqui.
+   Elas são buscadas em tempo de execução no endpoint /api/config (uma
+   função serverless da Vercel — veja o arquivo api/config.js), que por sua
+   vez lê as variáveis de ambiente SUPABASE_URL e SUPABASE_PUBLISHABLE_KEY
+   configuradas no painel da Vercel (Project Settings > Environment
+   Variables). Assim, trocar de arquivo HTML no futuro nunca mais exige
+   colar chave nenhuma de novo.
    ========================================================================= */
-const SUPABASE_CONFIG = {
-  url: 'https://kjkngdlglrwsewnhngih.supabase.co',   // <-- troque pela sua SUPABASE_URL
-  anonKey: 'sb_publishable_7ZxyCAOBOy3o4QRCI3z2IA_9WppcYbp'           // <-- troque pela sua SUPABASE_PUBLISHABLE_KEY (NUNCA a secret key)
-};
 const PHOTOS_BUCKET = 'andaime-fotos';
-
-const isConfigured = !SUPABASE_CONFIG.url.includes('SEU-PROJETO') && !SUPABASE_CONFIG.anonKey.includes('SUA_CHAVE');
-const sb = isConfigured ? window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey) : null;
+let sb = null;
+let isConfigured = false;
 
 function uid(prefix){ return prefix + '_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4); }
 
@@ -586,8 +577,9 @@ function Card({children, style, className}){
 }
 
 /* =========================================================================
-   TELA "CONFIGURAÇÃO NECESSÁRIA" — aparece se as chaves do Supabase
-   ainda não foram preenchidas no topo do arquivo.
+   TELA "CONFIGURAÇÃO NECESSÁRIA" — aparece se /api/config não devolveu
+   uma URL e chave válidas (variáveis de ambiente não configuradas na
+   Vercel, ou o app está sendo aberto fora da Vercel, como arquivo local).
    ========================================================================= */
 function ConfigNeeded(){
   return (
@@ -595,9 +587,10 @@ function ConfigNeeded(){
       <div style={{background:'#fff', borderRadius:14, padding:32, maxWidth:520, boxShadow:'0 20px 60px rgba(0,0,0,.4)'}}>
         <h1 style={{fontSize:20, margin:'0 0 12px'}}>⚙️ Configuração necessária</h1>
         <p style={{fontSize:14.5, color:'var(--ink-soft)', lineHeight:1.6, textTransform:'none'}}>
-          Este app precisa de um projeto Supabase conectado para funcionar. Abra o arquivo <code className="mono">ponto-do-andaime-cloud.html</code>,
-          localize o bloco <code className="mono">SUPABASE_CONFIG</code> no início do código e substitua <code className="mono">url</code> e <code className="mono">anonKey</code>
-          pelos dados do seu projeto (Project Settings → API no painel do Supabase).
+          Não consegui buscar as credenciais do Supabase em <code className="mono">/api/config</code>. Confira, no painel da Vercel,
+          se as variáveis de ambiente <code className="mono">SUPABASE_URL</code> e <code className="mono">SUPABASE_PUBLISHABLE_KEY</code> estão
+          definidas (Project Settings → Environment Variables) e se o arquivo <code className="mono">api/config.js</code> existe no repositório.
+          Depois de configurar, é preciso fazer um novo deploy pra valer.
         </p>
       </div>
     </div>
@@ -1890,11 +1883,24 @@ function App(){
   );
 }
 
-if(isConfigured){
-  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
-} else {
-  ReactDOM.createRoot(document.getElementById('root')).render(<ConfigNeeded />);
+/* Busca as credenciais em /api/config (função da Vercel) antes de montar
+   qualquer coisa. Se falhar (rede fora do ar, variáveis não configuradas,
+   ou rodando fora da Vercel), mostra a tela de configuração necessária. */
+async function bootstrap(){
+  try{
+    const res = await fetch('/api/config');
+    if(!res.ok) throw new Error('resposta não-ok de /api/config');
+    const config = await res.json();
+    if(!config.url || !config.anonKey) throw new Error('credenciais vazias');
+    sb = window.supabase.createClient(config.url, config.anonKey);
+    isConfigured = true;
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  }catch(err){
+    ReactDOM.createRoot(document.getElementById('root')).render(<ConfigNeeded />);
+  }
 }
+bootstrap();
+
 </script>
 </body>
 </html>
