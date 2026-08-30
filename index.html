@@ -103,7 +103,7 @@ function rowToRental(row){
     rentalNotes: row.rental_notes || '', address: row.address || '', number: row.number || '',
     complement: row.complement || '', neighborhood: row.neighborhood || '', city: row.city || '',
     state: row.state || '', zipCode: row.zip_code || '', locationUrl: row.location_url || '',
-    manualStatus: row.manual_status, createdAt: row.created_at, updatedAt: row.updated_at,
+    manualStatus: row.manual_status, closedAt: row.closed_at || '', createdAt: row.created_at, updatedAt: row.updated_at,
     photos: (row.photos || []).map(p => ({ id:p.id, storagePath:p.storage_path, description:p.description || '', createdAt:p.created_at }))
   };
 }
@@ -226,8 +226,12 @@ const rentalService = {
     const { error } = await sb.from('rentals').delete().eq('id', id);
     if(error) throw error;
   },
-  async setManualStatus(id, status){
-    const { error } = await sb.from('rentals').update({ manual_status: status, updated_at: new Date().toISOString() }).eq('id', id);
+  async setManualStatus(id, status, closedDate){
+    const { error } = await sb.from('rentals').update({
+      manual_status: status,
+      closed_at: status === 'encerrada' ? (closedDate || new Date().toISOString().slice(0,10)) : null,
+      updated_at: new Date().toISOString()
+    }).eq('id', id);
     if(error) throw error;
   }
 };
@@ -337,13 +341,15 @@ const photoService = {
     const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - days);
     const cutoffStr = cutoff.toISOString().slice(0,10);
     const { data, error } = await sb.from('rentals')
-      .select('id, customer_name, rental_date, expected_return_date, photos(id, storage_path)')
-      .lt('expected_return_date', cutoffStr);
+      .select('id, customer_name, rental_date, expected_return_date, closed_at, photos(id, storage_path)');
     if(error) throw error;
-    return data.filter(r => r.photos && r.photos.length > 0).map(r => ({
-      rentalId:r.id, customerName:r.customer_name, referenceDate:r.expected_return_date || r.rental_date,
-      photoCount:r.photos.length, photos:r.photos
-    }));
+    return data.filter(r => r.photos && r.photos.length > 0)
+      .map(r => ({
+        rentalId:r.id, customerName:r.customer_name,
+        referenceDate: r.closed_at || r.expected_return_date || r.rental_date,
+        photoCount:r.photos.length, photos:r.photos
+      }))
+      .filter(c => c.referenceDate && c.referenceDate < cutoffStr);
   },
   async cleanupOldPhotos(candidates){
     let removed = 0;
@@ -808,9 +814,9 @@ function Dashboard({rentals, onNavigate, onOpenRental}){
    LISTAGEM
    ========================================================================= */
 function exportRentalsCSV(rentals){
-  const headers = ['Cliente','CPF/CNPJ','Telefone','WhatsApp','E-mail','Data da locação','Devolução prevista','Status','Itens','Endereço','Bairro','Cidade','Estado','CEP','Link localização','Qtd. fotos','Observações'];
+  const headers = ['Cliente','CPF/CNPJ','Telefone','WhatsApp','E-mail','Data da locação','Devolução prevista','Data de encerramento','Status','Itens','Endereço','Bairro','Cidade','Estado','CEP','Link localização','Qtd. fotos','Observações'];
   const rows = rentals.map(r => [
-    r.customerName, r.document, r.phone, r.whatsapp, r.email, formatDate(r.rentalDate), formatDate(r.expectedReturnDate),
+    r.customerName, r.document, r.phone, r.whatsapp, r.email, formatDate(r.rentalDate), formatDate(r.expectedReturnDate), r.manualStatus==='encerrada' ? formatDate(r.closedAt) : '',
     STATUS_META[r.status]?.label || r.status,
     r.items.map(i => `${i.equipmentType}${i.quantity ? ' ('+i.quantity+')' : ''}`).join(' | '),
     [r.address, r.number].filter(Boolean).join(', '), r.neighborhood, r.city, r.state, r.zipCode,
@@ -1267,15 +1273,26 @@ function RentalDetails({rental, onBack, onEdit, onDeleteRequest, onStatusChanged
   const [urls, setUrls] = useState({});
   const [loadingPhotos, setLoadingPhotos] = useState(true);
   const [updatingStatus, setUpdatingStatus] = useState(false);
+  const [closeModalOpen, setCloseModalOpen] = useState(false);
+  const [closeDate, setCloseDate] = useState(() => new Date().toISOString().slice(0,10));
 
-  async function toggleEncerrada(){
+  async function confirmClose(){
     setUpdatingStatus(true);
     try{
-      const novoStatus = rental.manualStatus === 'encerrada' ? null : 'encerrada';
-      await rentalService.setManualStatus(rental.id, novoStatus);
-      pushToast(novoStatus ? 'Locação marcada como encerrada.' : 'Locação reaberta.', 'success');
+      await rentalService.setManualStatus(rental.id, 'encerrada', closeDate);
+      pushToast(`Locação encerrada com data de ${formatDate(closeDate)}.`, 'success');
+      setCloseModalOpen(false);
       onStatusChanged();
-    }catch(err){ pushToast('Erro ao atualizar status: ' + err.message, 'error'); }
+    }catch(err){ pushToast('Erro ao encerrar: ' + err.message, 'error'); }
+    finally{ setUpdatingStatus(false); }
+  }
+  async function reopen(){
+    setUpdatingStatus(true);
+    try{
+      await rentalService.setManualStatus(rental.id, null);
+      pushToast('Locação reaberta.', 'success');
+      onStatusChanged();
+    }catch(err){ pushToast('Erro ao reabrir: ' + err.message, 'error'); }
     finally{ setUpdatingStatus(false); }
   }
 
@@ -1301,9 +1318,11 @@ function RentalDetails({rental, onBack, onEdit, onDeleteRequest, onStatusChanged
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10}}>
         <button onClick={onBack} className="focus-ring" style={{background:'none', border:'none', fontSize:13.5, fontWeight:700, color:'var(--steel)'}}>← Voltar para locações</button>
         <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
-          <button onClick={toggleEncerrada} disabled={updatingStatus} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13, opacity:updatingStatus?.7:1}}>
-            {rental.manualStatus === 'encerrada' ? '🔓 Reabrir locação' : '✅ Marcar como encerrada'}
-          </button>
+          {rental.manualStatus === 'encerrada' ? (
+            <button onClick={reopen} disabled={updatingStatus} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13, opacity:updatingStatus?.7:1}}>🔓 Reabrir locação</button>
+          ) : (
+            <button onClick={()=>{setCloseDate(new Date().toISOString().slice(0,10)); setCloseModalOpen(true);}} disabled={updatingStatus} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13, opacity:updatingStatus?.7:1}}>✅ Marcar como encerrada</button>
+          )}
           <button onClick={onEdit} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:700, fontSize:13}}>✏️ Editar locação</button>
           <button onClick={()=>onDeleteRequest(rental)} className="focus-ring" style={{padding:'9px 16px', borderRadius:8, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontWeight:700, fontSize:13}}>🗑️ Excluir</button>
         </div>
@@ -1327,6 +1346,7 @@ function RentalDetails({rental, onBack, onEdit, onDeleteRequest, onStatusChanged
         <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))', gap:14, marginBottom:14}}>
           <DetailItem label="Data da locação" value={formatDate(rental.rentalDate)} />
           <DetailItem label="Devolução prevista" value={formatDate(rental.expectedReturnDate)} />
+          {rental.manualStatus === 'encerrada' && <DetailItem label="Encerrada em" value={formatDate(rental.closedAt)} />}
         </div>
         <div style={{fontSize:11.5, fontWeight:700, color:'var(--steel)', textTransform:'uppercase', letterSpacing:'.03em', marginBottom:6}}>Itens</div>
         {rental.items.length === 0 ? (
@@ -1372,6 +1392,20 @@ function RentalDetails({rental, onBack, onEdit, onDeleteRequest, onStatusChanged
       {lightbox && (
         <div onClick={()=>setLightbox(null)} style={{position:'fixed', inset:0, background:'rgba(0,0,0,.85)', zIndex:200, display:'flex', alignItems:'center', justifyContent:'center', padding:20}}>
           <img src={lightbox} style={{maxWidth:'92vw', maxHeight:'88vh', borderRadius:10}} />
+        </div>
+      )}
+
+      {closeModalOpen && (
+        <div style={{position:'fixed', inset:0, background:'rgba(28,33,38,.55)', zIndex:150, display:'flex', alignItems:'center', justifyContent:'center', padding:16}} onClick={()=>setCloseModalOpen(false)}>
+          <div onClick={e=>e.stopPropagation()} className="fade-in" style={{background:'#fff', borderRadius:12, maxWidth:380, width:'100%', padding:24, boxShadow:'0 20px 60px rgba(0,0,0,.3)'}}>
+            <h3 style={{margin:'0 0 8px', fontSize:17}}>Encerrar locação</h3>
+            <p style={{margin:'0 0 14px', fontSize:13, color:'var(--ink-soft)', textTransform:'none', lineHeight:1.5}}>Em que data o andaime foi devolvido/retirado? Pode ser antes ou depois da devolução prevista ({formatDate(rental.expectedReturnDate)}).</p>
+            <Field label="Data de encerramento"><Input type="date" value={closeDate} onChange={e=>setCloseDate(e.target.value)} /></Field>
+            <div style={{display:'flex', gap:10, justifyContent:'flex-end', marginTop:8}}>
+              <button onClick={()=>setCloseModalOpen(false)} className="focus-ring" style={{padding:'10px 18px', borderRadius:8, border:'1px solid var(--steel-line)', background:'#fff', fontWeight:600}}>Cancelar</button>
+              <button onClick={confirmClose} disabled={updatingStatus || !closeDate} className="focus-ring" style={{padding:'10px 20px', borderRadius:8, border:'none', background:'var(--safety)', color:'#fff', fontWeight:700, opacity:updatingStatus?.7:1}}>{updatingStatus?'Salvando…':'Confirmar encerramento'}</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
