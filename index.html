@@ -94,7 +94,7 @@ function rowToRental(row){
     rentalNotes: row.rental_notes || '', address: row.address || '', number: row.number || '',
     complement: row.complement || '', neighborhood: row.neighborhood || '', city: row.city || '',
     state: row.state || '', zipCode: row.zip_code || '', locationUrl: row.location_url || '',
-    manualStatus: row.manual_status, closedAt: row.closed_at || '', createdAt: row.created_at, updatedAt: row.updated_at,
+    manualStatus: row.manual_status, closedAt: row.closed_at || '', deletedAt: row.deleted_at || null, createdAt: row.created_at, updatedAt: row.updated_at,
     photos: (row.photos || []).map(p => ({ id:p.id, storagePath:p.storage_path, description:p.description || '', createdAt:p.created_at }))
   };
 }
@@ -178,7 +178,7 @@ async function replaceRentalItems(rentalId, items){
 
 const rentalService = {
   async list(){
-    const { data, error } = await sb.from('rentals').select('*, photos(*), rental_items(*)').order('created_at', { ascending:false });
+    const { data, error } = await sb.from('rentals').select('*, photos(*), rental_items(*)').is('deleted_at', null).order('created_at', { ascending:false });
     if(error) throw error;
     return data.map(rowToRental).map(r => ({...r, status: computeStatus(r)}));
   },
@@ -209,7 +209,27 @@ const rentalService = {
     const { data: fresh } = await sb.from('rentals').select('*, photos(*), rental_items(*)').eq('id', id).single();
     return rowToRental(fresh);
   },
+  /* Exclusão SUAVE: só marca deleted_at, não apaga nada de verdade — nem
+     a locação, nem as fotos no Storage. Vai pra lixeira, recuperável.
+     Como o Supabase free não tem backup nenhum, isso é a única rede de
+     segurança real contra exclusão feita sem querer. */
   async remove(id){
+    const { error } = await sb.from('rentals').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+    if(error) throw error;
+  },
+  async restore(id){
+    const { error } = await sb.from('rentals').update({ deleted_at: null }).eq('id', id);
+    if(error) throw error;
+  },
+  async listTrash(){
+    const { data, error } = await sb.from('rentals').select('*, photos(*), rental_items(*)').not('deleted_at', 'is', null).order('deleted_at', { ascending:false });
+    if(error) throw error;
+    return data.map(rowToRental).map(r => ({...r, status: computeStatus(r)}));
+  },
+  /* Exclusão DEFINITIVA — aqui sim apaga a locação e as fotos no Storage
+     de vez. Só é chamada a partir da tela de Lixeira, nunca direto da
+     listagem principal. */
+  async purge(id){
     const { data: photos } = await sb.from('photos').select('storage_path').eq('rental_id', id);
     if(photos && photos.length){
       await sb.storage.from(PHOTOS_BUCKET).remove(photos.map(p => p.storage_path));
@@ -332,7 +352,8 @@ const photoService = {
     const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - days);
     const cutoffStr = cutoff.toISOString().slice(0,10);
     const { data, error } = await sb.from('rentals')
-      .select('id, customer_name, rental_date, expected_return_date, closed_at, photos(id, storage_path)');
+      .select('id, customer_name, rental_date, expected_return_date, closed_at, photos(id, storage_path)')
+      .is('deleted_at', null);
     if(error) throw error;
     return data.filter(r => r.photos && r.photos.length > 0)
       .map(r => ({
@@ -467,6 +488,35 @@ function exportToCSV(filename, headers, rows){
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/* Backup completo, em JSON, de tudo que está no banco — locações (com
+   itens e os REGISTROS das fotos, não os arquivos em si), clientes, tipos
+   de andaime e configurações. Não substitui um backup de verdade (a
+   Supabase não oferece nenhum no plano gratuito), mas é um jeito rápido de
+   ter uma cópia guardada fora do Supabase de vez em quando. */
+async function downloadFullBackup(){
+  const [rentalsRes, customersRes, typesRes, settingsRes] = await Promise.all([
+    sb.from('rentals').select('*, photos(id, storage_path, description, created_at), rental_items(*)'),
+    sb.from('customers').select('*'),
+    sb.from('equipment_types').select('*'),
+    sb.from('settings').select('*')
+  ]);
+  if(rentalsRes.error) throw rentalsRes.error;
+  if(customersRes.error) throw customersRes.error;
+  if(typesRes.error) throw typesRes.error;
+  if(settingsRes.error) throw settingsRes.error;
+  const backup = {
+    generatedAt: new Date().toISOString(),
+    note: 'Backup do Ponto do Andaime. NÃO inclui os arquivos de foto (só os registros/caminhos) — as fotos em si ficam no Supabase Storage.',
+    rentals: rentalsRes.data, customers: customersRes.data, equipmentTypes: typesRes.data, settings: settingsRes.data
+  };
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `backup_ponto_do_andaime_${new Date().toISOString().slice(0,10)}.json`;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
@@ -1595,6 +1645,7 @@ function ClientEditModal({customer, onClose, onSaved, pushToast}){
 function SettingsScreen({pushToast}){
   const [form, setForm] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
   const [days, setDays] = useState(30);
   const [candidates, setCandidates] = useState(null);
   const [checkingCleanup, setCheckingCleanup] = useState(false);
@@ -1609,6 +1660,12 @@ function SettingsScreen({pushToast}){
     try{ await settingsService.save(form); pushToast('Configurações salvas com sucesso.', 'success'); }
     catch(err){ pushToast('Erro ao salvar: ' + err.message, 'error'); }
     finally{ setSaving(false); }
+  }
+  async function handleBackup(){
+    setBackingUp(true);
+    try{ await downloadFullBackup(); pushToast('Backup baixado. Guarde esse arquivo fora do Supabase (Google Drive, e-mail, etc.).', 'success'); }
+    catch(err){ pushToast('Erro ao gerar backup: ' + err.message, 'error'); }
+    finally{ setBackingUp(false); }
   }
 
   async function checkCleanup(){
@@ -1653,6 +1710,16 @@ function SettingsScreen({pushToast}){
     </form>
 
     <Card style={{maxWidth:560}}>
+      <h2 style={{fontSize:15, margin:'0 0 6px'}}>💾 Backup completo</h2>
+      <p style={{fontSize:12.5, color:'var(--ink-soft)', margin:'0 0 16px', textTransform:'none', lineHeight:1.5}}>
+        O Supabase no plano gratuito não faz backup automático de nada. Baixe este arquivo de vez em quando (ex.: uma vez por mês) e guarde num lugar fora do Supabase — Google Drive, e-mail pra você mesmo, etc. Inclui clientes, locações, itens e tipos de andaime. Não inclui os arquivos de foto em si (só o registro deles).
+      </p>
+      <button type="button" onClick={handleBackup} disabled={backingUp} className="focus-ring" style={{padding:'11px 20px', borderRadius:8, border:'none', background:'var(--steel)', color:'#fff', fontWeight:700, fontSize:13.5, opacity:backingUp?.7:1}}>
+        {backingUp ? 'Gerando…' : '📦 Baixar backup completo'}
+      </button>
+    </Card>
+
+    <Card style={{maxWidth:560}}>
       <h2 style={{fontSize:15, margin:'0 0 6px'}}>🧹 Limpar fotos antigas</h2>
       <p style={{fontSize:12.5, color:'var(--ink-soft)', margin:'0 0 16px', textTransform:'none', lineHeight:1.5}}>
         Apaga só as FOTOS (não a locação) de obras cuja devolução já passou há mais de X dias. Útil para liberar espaço de armazenamento — nada aqui roda sozinho, você decide quando rodar.
@@ -1682,7 +1749,85 @@ function SettingsScreen({pushToast}){
     </Card>
 
     <EquipmentTypesCard pushToast={pushToast} />
+    <TrashCard pushToast={pushToast} />
     </div>
+  );
+}
+
+function TrashCard({pushToast}){
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [restoringId, setRestoringId] = useState(null);
+  const [purgeTarget, setPurgeTarget] = useState(null);
+  const [purging, setPurging] = useState(false);
+  const [purgingOld, setPurgingOld] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try{ setItems(await rentalService.listTrash()); }
+    catch(err){ pushToast('Erro ao carregar lixeira: ' + err.message, 'error'); }
+    finally{ setLoading(false); }
+  }, [pushToast]);
+  useEffect(() => { load(); }, [load]);
+
+  async function restore(id){
+    setRestoringId(id);
+    try{ await rentalService.restore(id); pushToast('Locação restaurada.', 'success'); load(); }
+    catch(err){ pushToast('Erro ao restaurar: ' + err.message, 'error'); }
+    finally{ setRestoringId(null); }
+  }
+  async function confirmPurge(){
+    setPurging(true);
+    try{ await rentalService.purge(purgeTarget.id); pushToast('Locação apagada de vez.', 'success'); setPurgeTarget(null); load(); }
+    catch(err){ pushToast('Erro ao apagar: ' + err.message, 'error'); }
+    finally{ setPurging(false); }
+  }
+  const old = items.filter(i => (Date.now() - new Date(i.deletedAt).getTime()) > 1000*60*60*24*30);
+  async function purgeOld(){
+    setPurgingOld(true);
+    try{
+      for(const it of old){ await rentalService.purge(it.id); }
+      pushToast(`${old.length} locação(ões) com mais de 30 dias na lixeira foram apagadas de vez.`, 'success');
+      load();
+    }catch(err){ pushToast('Erro ao esvaziar: ' + err.message, 'error'); }
+    finally{ setPurgingOld(false); }
+  }
+
+  return (
+    <Card style={{maxWidth:560}}>
+      <h2 style={{fontSize:15, margin:'0 0 6px'}}>🗑️ Lixeira</h2>
+      <p style={{fontSize:12.5, color:'var(--ink-soft)', margin:'0 0 16px', textTransform:'none', lineHeight:1.5}}>
+        Locações excluídas ficam aqui, recuperáveis, em vez de somem na hora. Nada aqui é apagado de vez sozinho — só quando você mandar.
+      </p>
+      {loading ? <Spinner label="Carregando lixeira…" /> : items.length === 0 ? (
+        <div style={{fontSize:13, color:'var(--ink-soft)'}}>A lixeira está vazia.</div>
+      ) : (
+        <>
+          {old.length > 0 && (
+            <button type="button" onClick={purgeOld} disabled={purgingOld} className="focus-ring" style={{marginBottom:12, padding:'9px 16px', borderRadius:8, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontWeight:700, fontSize:12.5}}>
+              {purgingOld ? 'Apagando…' : `🗑️ Esvaziar ${old.length} item(ns) com mais de 30 dias`}
+            </button>
+          )}
+          <div style={{display:'flex', flexDirection:'column', gap:8, maxHeight:280, overflowY:'auto'}}>
+            {items.map(it => (
+              <div key={it.id} style={{display:'flex', justifyContent:'space-between', alignItems:'center', gap:10, border:'1px solid var(--steel-line)', borderRadius:9, padding:10, flexWrap:'wrap'}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontWeight:700, fontSize:13.5}}>{it.customerName}</div>
+                  <div style={{fontSize:11.5, color:'var(--ink-soft)'}}>Excluída em {formatDate(it.deletedAt ? it.deletedAt.slice(0,10) : '')}</div>
+                </div>
+                <div style={{display:'flex', gap:6}}>
+                  <button onClick={()=>restore(it.id)} disabled={restoringId===it.id} className="focus-ring" style={{padding:'7px 11px', borderRadius:7, border:'1px solid var(--steel-line)', background:'#fff', fontSize:12, fontWeight:600}}>♻️ Restaurar</button>
+                  <button onClick={()=>setPurgeTarget(it)} className="focus-ring" style={{padding:'7px 11px', borderRadius:7, border:'1px solid #F3D3CD', background:'#FDF2F0', color:'var(--danger)', fontSize:12, fontWeight:600}}>🗑️ Apagar de vez</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      <ConfirmModal open={!!purgeTarget} busy={purging} title="Apagar de vez"
+        message={purgeTarget ? `Apagar "${purgeTarget.customerName}" definitivamente, incluindo as fotos? Isso NÃO pode ser desfeito de jeito nenhum.` : ''}
+        confirmLabel="Apagar de vez" onConfirm={confirmPurge} onCancel={()=>setPurgeTarget(null)} />
+    </Card>
   );
 }
 
@@ -1869,9 +2014,9 @@ function App(){
       </div>
       <BottomNav active={screen==='form'?'new':screen} onNavigate={navigate} />
       <Toast toasts={toasts} onDismiss={dismiss} />
-      <ConfirmModal open={!!deleteTarget} busy={deleting} title="Excluir locação"
-        message={deleteTarget ? `Tem certeza que deseja excluir a locação de "${deleteTarget.customerName}"? As fotos também serão apagadas. Esta ação não pode ser desfeita.` : ''}
-        confirmLabel="Excluir" onConfirm={confirmDelete} onCancel={()=>setDeleteTarget(null)} />
+      <ConfirmModal open={!!deleteTarget} busy={deleting} title="Mover para a lixeira" danger={false}
+        message={deleteTarget ? `Mover a locação de "${deleteTarget.customerName}" para a lixeira? Ela some das listas, mas fica recuperável em Configurações → Lixeira. As fotos não são apagadas.` : ''}
+        confirmLabel="Mover para lixeira" onConfirm={confirmDelete} onCancel={()=>setDeleteTarget(null)} />
       <style>{`
         @media (min-width: 768px){
           .hidden.md\\:flex{ display:flex !important; } .hidden.md\\:block{ display:block !important; }
